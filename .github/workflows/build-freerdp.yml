@@ -241,11 +241,36 @@ jobs:
           # 4) 写 local.properties，确保 Gradle 找到 SDK
           echo "sdk.dir=$SDK" > local.properties
 
+          # 4.5) 【固定签名】校验仓库内 keystore 存在，并用它覆盖 runner 上的随机 debug.keystore。
+          #
+          # 背景：AGP 默认在 ~/.android/debug.keystore 自动生成一个随机调试签名，
+          # 每次 CI 全新 runner 都会生成不同的证书 -> 每个 APK 签名都不一样 ->
+          # 用户覆盖安装时报「签名冲突」。
+          #
+          # 方案：仓库里存放固定 keystore，app/build.gradle.kts 的 debug/release
+          # 两个 buildType 都绑定它。这里额外做一道"双保险"：
+          # 也把它写到 ~/.android/debug.keystore，杜绝任何回退到随机签名的可能。
+          test -f keystore/accessrdp-release.jks || { echo "ERROR: 缺少固定 keystore"; exit 1; }
+          keytool -list -keystore keystore/accessrdp-release.jks -storepass accessrdp2024 -alias accessrdp >/dev/null \
+            || { echo "ERROR: keystore 校验失败"; exit 1; }
+          mkdir -p ~/.android
+          cp -f keystore/accessrdp-release.jks ~/.android/debug.keystore
+          echo "==== 固定签名使用中，证书指纹： ===="
+          keytool -list -v -keystore keystore/accessrdp-release.jks -storepass accessrdp2024 -alias accessrdp \
+            | grep -E "SHA256|Valid from" || true
+
           # 5) 打包
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
-          cp app/build/outputs/apk/debug/app-debug.apk app-debug.apk
+          APK_OUT="$(ls app/build/outputs/apk/debug/*.apk | head -1)"
+          echo "构建产物：$APK_OUT"
+          cp "$APK_OUT" app-debug.apk
           ls -la app-debug.apk
+
+          # 5.5) 打印最终 APK 的签名指纹，便于比对"每次是否一致"
+          echo "==== 最终 APK 签名指纹（应与上面一致）===="
+          "$SDK"/build-tools/34.0.0/apksigner verify --print-certs app-debug.apk \
+            | grep -E "SHA-256|SHA-1" | head -4 || true
 
           # 6) 【防残废 APK 硬校验】
           # 必须保证 APK 内出现的每个 lib/<abi>/ 目录都带齐 FreeRDP 全套库。
@@ -287,5 +312,22 @@ jobs:
         with:
           files: app-debug.apk
           body: |
-            AccessRDP 真实连接版（已集成 FreeRDP 原生库 + 远端音频重定向）。
-            安装后点“连接”即为真实远程桌面；NVDA 等读屏语音会通过 RDP 音频重定向传回手机播放。
+            ## AccessRDP v1.0.4 —— 真实连接修复 + 固定签名
+
+            ### 本次修复
+            1. **真实主机连不上** —— 补齐 FreeRDP 官方要求的安全配置：
+               - 新增 `VerifyCertificateEx` / `VerifyChangedCertificateEx` 证书回调
+                 （2.11 里仅设 `IgnoreCertificate` 不足以接受 Windows 自签名证书）
+               - 显式开启 `NegotiateSecurityLayer` / `Authentication` / `Encryption`
+                 （对齐 xfreerdp 的 `-nego` / `-authentication` / `-encryption` 默认值）
+               - 强制 TLS 1.2+（`TLSMinVersion=0x0303`），对齐 `+enforce-tlsv1_2`
+               - NLA 模式下同时保留 TLS，便于回退协商
+            2. **不再只报"连接失败"** —— 通过 `freerdp_get_last_error_string()`
+               取回底层真实原因（TLS 握手失败 / 认证失败 / DNS 失败 / 端口不通等），
+               用 TalkBack 播报，并写入日志文件。
+            3. **固定签名** —— 仓库内固定 keystore，debug/release 统一签名。
+               从此每个 APK 签名完全一致，**可直接覆盖安装，无需卸载**。
+               证书 SHA-256：`95:97:18:E4:82:EB:32:41:B7:7D:72:17:87:32:73:DB:12:D6:AC:58:F2:D0:0D:6F:B0:58:D3:F8:52:9E:1B:37`
+
+            ### 日志位置
+            `文件管理 → 下载 → AccessRDP → crash-*.txt / run-*.txt`

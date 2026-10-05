@@ -160,9 +160,26 @@ class RdpViewModel : ViewModel() {
                 is ConnectionResult.Success ->
                     _announcement.value = "已连接，键盘已显示"
                 is ConnectionResult.Failure -> {
-                    // 统一失败话术（用户要求）：不暴露技术细节，只给可执行的提示。
-                    Log.w(TAG, "连接失败原因：${result.reason}")
-                    _announcement.value = "连接失败，请检查主机和端口"
+                    // 播报策略：给出可执行的主提示 + 底层真实原因，便于用户自查与反馈。
+                    // 例如 TLS 失败 / 认证失败 / DNS 失败 / 端口不通，都会体现在 reason 里。
+                    val reason = result.reason
+                    Log.w(TAG, "连接失败原因：$reason")
+                    _announcement.value = if (reason.isBlank()) {
+                        "连接失败，请检查主机和端口"
+                    } else {
+                        "连接失败，请检查主机和端口。原因：$reason"
+                    }
+                    // 同时把失败原因落到日志文件，方便用户回传
+                    try {
+                        AccessRdpApp.instance?.let { ctx ->
+                            CrashLogger.log(
+                                ctx, "连接失败",
+                                "目标=${config.host}:${config.port} 原因=$reason"
+                            )
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "写连接失败日志失败", t)
+                    }
                 }
             }
         }

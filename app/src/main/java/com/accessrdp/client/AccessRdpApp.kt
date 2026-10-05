@@ -15,8 +15,18 @@ import com.accessrdp.client.jni.FreerdpJni
  */
 class AccessRdpApp : Application() {
 
+    companion object {
+        /** 全局 application 引用（供 ViewModel 等写日志用）。 */
+        @Volatile
+        var instance: AccessRdpApp? = null
+            private set
+    }
+
     override fun onCreate() {
         super.onCreate()
+
+        // 保存 application 引用，供 ViewModel 等无 Context 的组件写崩溃/运行日志。
+        instance = this
 
         // 1) 最先安装崩溃捕获，确保后续任何异常都能落盘。
         try {

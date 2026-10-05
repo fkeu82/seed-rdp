@@ -110,6 +110,15 @@ object FreerdpJni {
     /** 断开会话。 */
     external fun nativeDisconnect(): Boolean
 
+    /**
+     * 取回最近一次连接失败的详细原因（由原生层通过 freerdp_get_last_error_string 生成）。
+     *
+     * 这是「不要只报一句模糊的连接失败」的实现：底层会返回诸如
+     * 「TLS 连接失败」「认证失败」「DNS 解析失败」「连接被拒绝」等具体描述。
+     * 无错误时返回空串。
+     */
+    external fun nativeGetLastError(): String
+
     // ---------------- 键盘：核心接口 ----------------
 
     /**

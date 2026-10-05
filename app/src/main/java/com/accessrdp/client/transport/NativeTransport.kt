@@ -60,7 +60,16 @@ class NativeTransport : RdpTransport {
                 }
                 ConnectionResult.Success
             } else {
-                ConnectionResult.Failure("连接失败，请检查主机和端口")
+                // 【关键】把底层真实原因带回去，而不是只说一句"连接失败"。
+                // nativeGetLastError 对应 freerdp_get_last_error_string()，
+                // 能区分 TLS 握手失败 / 认证失败 / DNS 失败 / 端口不通 等情况。
+                val detail = try {
+                    FreerdpJni.nativeGetLastError().takeIf { it.isNotBlank() }
+                } catch (t: Throwable) {
+                    null
+                }
+                Log.e(TAG, "nativeConnect 返回 false，底层原因：${detail ?: "未提供"}")
+                ConnectionResult.Failure(detail ?: "底层未返回具体原因")
             }
         } catch (e: UnsatisfiedLinkError) {
             connected = false

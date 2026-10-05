@@ -22,6 +22,7 @@
 #endif
 
 #include <jni.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <android/log.h>
@@ -29,6 +30,7 @@
 #include <freerdp/freerdp.h>
 #include <freerdp/settings.h>
 #include <freerdp/input.h>
+#include <freerdp/error.h>            /* freerdp_get_last_error / _string */
 #include <freerdp/channels/channels.h> /* freerdp_channels_load_plugin */
 #include <winpr/crt.h>
 
@@ -41,9 +43,67 @@ static freerdp* g_instance = NULL;
 /* AudioRedirect.setEnabled(boolean) 的 jmethodID（JNI_OnLoad 时缓存）。 */
 static jmethodID g_setEnabled = NULL;
 
+/* 最近一次连接失败的详细信息（供 Kotlin 通过 nativeGetLastError 取回并播报）。 */
+static char g_last_error[1024] = { 0 };
+
 /* 键盘扫描码：扩展位来自 Kotlin 约定的 0xE000；RDP 侧的 KBDEXT 由
  * MAKE_RDP_SCANCODE 宏（freerdp/scancode.h，经 input.h 引入）自动处理。 */
 #define ACCESSRDP_SCANCODE_EXT_MASK 0xE000
+
+/* ------------------------------------------------------------------ */
+/* 证书校验回调                                                        */
+/*                                                                     */
+/* 【关键修复】这是 v1.0.3 连不上真实主机的头号原因。                   */
+/*                                                                     */
+/* FreeRDP 2.11 的 libfreerdp/crypto/tls.c 中，当服务器的证书不在      */
+/* known_hosts 文件里时，会按以下顺序决定是否接受：                     */
+/*   1. AutoAcceptCertificate == TRUE  -> 接受                         */
+/*   2. AutoDenyCertificate  == TRUE   -> 拒绝                         */
+/*   3. 调用 VerifyX509Certificate / VerifyCertificateEx 回调           */
+/*   4. 都没有 -> accept_certificate = 0（拒绝）-> 连接失败             */
+/*                                                                     */
+/* 我们此前只设了 IgnoreCertificate，在 2.11 里并不足以自动接受未信任   */
+/* 证书（Windows 自签名/RDP 默认证书就属于此类），所以必然握手失败。     */
+/* 这里按官方示例补上回调，返回 1（接受并记住），确保能连上。            */
+/* ------------------------------------------------------------------ */
+
+/** 未信任证书：直接接受并存储（无界面客户端无法弹窗确认）。 */
+static DWORD android_verify_certificate_ex(freerdp* instance, const char* host, UINT16 port,
+                                           const char* common_name, const char* subject,
+                                           const char* issuer, const char* fingerprint,
+                                           DWORD flags)
+{
+	(void)instance;
+	(void)flags;
+	(void)common_name;
+	__android_log_print(ANDROID_LOG_WARN, TAG,
+	                    "接受未信任证书 %s:%u subject=%s issuer=%s fp=%s",
+	                    host ? host : "?", (unsigned)port,
+	                    subject ? subject : "?", issuer ? issuer : "?",
+	                    fingerprint ? fingerprint : "?");
+	return 1; /* 1 = 接受并存入 known_hosts */
+}
+
+/** 证书发生变化：同样接受（无界面客户端无法询问用户）。 */
+static DWORD android_verify_changed_certificate_ex(
+    freerdp* instance, const char* host, UINT16 port, const char* common_name,
+    const char* subject, const char* issuer, const char* new_fingerprint,
+    const char* old_subject, const char* old_issuer, const char* old_fingerprint,
+    DWORD flags)
+{
+	(void)instance;
+	(void)flags;
+	(void)common_name;
+	(void)issuer;
+	(void)old_subject;
+	(void)old_issuer;
+	(void)old_fingerprint;
+	__android_log_print(ANDROID_LOG_WARN, TAG,
+	                    "证书已变更，接受新证书 %s:%u subject=%s new_fp=%s",
+	                    host ? host : "?", (unsigned)port,
+	                    subject ? subject : "?", new_fingerprint ? new_fingerprint : "?");
+	return 1;
+}
 
 /* ------------------------------------------------------------------ */
 /* JNI 装载：缓存 JVM 与回调方法                                       */
@@ -111,6 +171,9 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	const char* userStr = NULL;
 	const char* passStr = NULL;
 	const char* domStr  = NULL;
+
+	/* 每次连接先清空上一次的错误描述，避免旧错误被误播报。 */
+	g_last_error[0] = '\0';
 	jboolean result = JNI_FALSE;
 
 	/* ---- 0) 先安全关闭上一个会话（避免重复连接时泄漏 / 二次 free）---- */
@@ -172,26 +235,72 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	if (passStr && passStr[0] != '\0') s->Password = strdup(passStr);
 	if (domStr  && domStr[0]  != '\0') s->Domain   = strdup(domStr);
 
-	/* 安全层：0=自动 1=RDP 2=TLS 3=NLA。注意 FreeRDP 要求至少启用一种安全层，
-	 * 否则握手阶段会断言失败；这里对非法输入回退到 NLA。 */
+	/* 安全层：0=自动 1=RDP 2=TLS 3=NLA。
+	 *
+	 * 【关键修复】必须显式打开 NegotiateSecurityLayer / Authentication，
+	 * 这两项是官方 xfreerdp 的默认值（-nego / -authentication 默认 on），
+	 * 但 freerdp_new() + freerdp_context_new() 的裸实例并不会帮我们设好它们：
+	 *   - NegotiateSecurityLayer=FALSE 时不会做 X.224 安全协商，和现代 Windows 谈不拢；
+	 *   - Authentication=FALSE 时 NLA/CredSSP 无从进行，直接被服务器拒绝。
+	 * 这是 v1.0.3「IP 密码都对却连不上」的核心原因之一。
+	 *
+	 * 注：RDP 的加密级别（EncryptionLevel/Methods）仅在经典的 RDP 安全层下才有意义，
+	 * NLA/TLS 下由 TLS 负责加密，无需手动设置。 */
+	s->NegotiateSecurityLayer = TRUE;
+	s->Authentication        = TRUE;
+	s->ExtSecurity           = FALSE;
+
+	/* 按用户选择设置可用的安全层组合；默认(0/其它)全开以便自动协商。 */
 	switch (securityLevel)
 	{
-		case 1: s->RdpSecurity = TRUE; s->TlsSecurity = FALSE; s->NlaSecurity = FALSE; break;
-		case 2: s->RdpSecurity = FALSE; s->TlsSecurity = TRUE; s->NlaSecurity = FALSE; break;
-		case 3: s->RdpSecurity = FALSE; s->TlsSecurity = FALSE; s->NlaSecurity = TRUE; break;
+		case 1:
+			s->RdpSecurity = TRUE;
+			s->TlsSecurity = FALSE;
+			s->NlaSecurity = FALSE;
+			break;
+		case 2:
+			s->RdpSecurity = FALSE;
+			s->TlsSecurity = TRUE;
+			s->NlaSecurity = FALSE;
+			break;
+		case 3:
+			s->RdpSecurity = FALSE;
+			s->TlsSecurity = TRUE;   /* 保留 TLS：NLA 失败时仍可回退 */
+			s->NlaSecurity = TRUE;
+			break;
 		default:
-			s->RdpSecurity = TRUE; s->TlsSecurity = TRUE; s->NlaSecurity = TRUE; break;
+			/* 自动：三种全开，由 NegotiateSecurityLayer 与服务器协商最优方案 */
+			s->RdpSecurity = TRUE;
+			s->TlsSecurity = TRUE;
+			s->NlaSecurity = TRUE;
+			break;
 	}
+
+	/* 【关键修复】强制 TLS 1.2+。
+	 * 现代 Windows（2016 以后 / 已打补丁的 2012 R2+）在 NLA 下普遍要求 TLS1.2，
+	 * 而 FreeRDP 默认可能按 TLS1.0 协商 -> 服务器直接拒绝握手。
+	 * 0x0303 = TLS1.2，0x0304 = TLS1.3。官方对应的是 +enforce-tlsv1_2。 */
+	s->TLSMinVersion = 0x0303;
+	s->TLSMaxVersion = 0x0304;
+	s->TlsSecLevel   = 1;
+
+	/* 【关键修复】证书回调。
+	 * 官方 tls.c 在证书未被信任时会调用这两个回调，返回 1 表示接受。
+	 * 若不设置，且 AutoAcceptCertificate 为 FALSE，则一定拒绝 -> 连接失败。 */
+	instance->VerifyCertificateEx        = android_verify_certificate_ex;
+	instance->VerifyChangedCertificateEx = android_verify_changed_certificate_ex;
+
+	/* 无界面环境无法弹出证书确认框：自动接受自签名证书，避免卡死在握手。
+	 * 与上面的回调形成双保险（回调未触发时 AutoAccept 兜底）。 */
+	s->IgnoreCertificate     = TRUE;
+	s->AutoAcceptCertificate = TRUE;
+	s->AutoDenyCertificate   = FALSE;
 
 	/* 无界面客户端：软件 GDI 渲染（不需要真实显示也能拿到音频/输入通道）。 */
 	s->SoftwareGdi   = TRUE;
 	s->ColorDepth    = 16;
 	s->DesktopWidth  = 1024;
 	s->DesktopHeight = 768;
-
-	/* 无头环境无法弹出证书确认框，直接接受自签名证书，避免卡死在握手。 */
-	s->IgnoreCertificate     = TRUE;
-	s->AutoAcceptCertificate = TRUE;
 
 	/* 连接超时：避免 IP 不通时无限阻塞（用户体验 + 防止 ANR）。
 	 * 单位毫秒，10 秒是局域网/公网都较合理的值。
@@ -226,9 +335,31 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 
 	if (!ok)
 	{
+		/* 【关键】把 FreeRDP 底层的真实错误码/错误串带回来，
+		 * 而不是只给用户一句模糊的“连接失败”。
+		 * freerdp_get_last_error() 返回错误码（如 FREERDP_ERROR_TLS_CONNECT_FAILED），
+		 * freerdp_get_last_error_string() 返回人类可读描述。 */
+		UINT32 errCode = freerdp_get_last_error(instance->context);
+		const char* errName = freerdp_get_last_error_name(errCode);
+		const char* errStr  = freerdp_get_last_error_string(errCode);
+		const char* errCat  = freerdp_get_last_error_category(errCode);
+
 		__android_log_print(ANDROID_LOG_ERROR, TAG,
-		                    "freerdp_connect 失败：%s:%d",
-		                    hostStr, (int)s->ServerPort);
+		                    "freerdp_connect 失败 %s:%d 错误码=0x%08X 名称=%s 分类=%s 描述=%s",
+		                    hostStr, (int)s->ServerPort,
+		                    (unsigned)errCode,
+		                    errName ? errName : "?",
+		                    errCat ? errCat : "?",
+		                    errStr ? errStr : "?");
+
+		/* 组装一句能直接播报、且能指导排查的中文描述 */
+		snprintf(g_last_error, sizeof(g_last_error),
+		         "%s（%s%s%s）",
+		         errStr ? errStr : "未知错误",
+		         errName ? errName : "",
+		         errName ? ":" : "",
+		         errCat ? errCat : "");
+
 		/* [崩溃点 3 修复] 失败路径彻底释放，绝不留半初始化实例在全局 */
 		freerdp_disconnect(instance);
 		freerdp_free(instance);
@@ -270,6 +401,17 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeDisconnect(JNIEnv* env, jclass cl
 		g_instance = NULL;
 	}
 	return JNI_TRUE;
+}
+
+/*
+ * 取回最近一次连接失败的详细描述（由 nativeConnect 失败时写入）。
+ * 返回 UTF-8 字符串；无错误时返回空串。供 Kotlin 用 TalkBack 播报真实原因。
+ */
+JNIEXPORT jstring JNICALL
+Java_com_accessrdp_client_jni_FreerdpJni_nativeGetLastError(JNIEnv* env, jclass clazz)
+{
+	(void)clazz;
+	return (*env)->NewStringUTF(env, g_last_error);
 }
 
 /* ------------------------------------------------------------------ */
