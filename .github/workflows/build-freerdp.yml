@@ -243,6 +243,33 @@ jobs:
           cp app/build/outputs/apk/debug/app-debug.apk app-debug.apk
           ls -la app-debug.apk
 
+          # 6) 【防残废 APK 硬校验】
+          # 必须保证 APK 内出现的每个 lib/<abi>/ 目录都带齐 FreeRDP 全套库。
+          # 否则真机上 ABI 选错 -> UnsatisfiedLinkError -> 一打开就闪退。
+          echo "==== APK 内 ABI 目录与 .so 清单 ===="
+          unzip -l app-debug.apk | grep -E "^ *[0-9]+ .*lib/" | awk '{print $4}' | sort
+          echo "==== 逐 ABI 校验 ===="
+          for ABI in arm64-v8a armeabi-v7a; do
+            LIST="$(unzip -l app-debug.apk | awk '{print $4}' | grep "^lib/$ABI/")"
+            if [ -z "$LIST" ]; then
+              echo "ERROR: APK 缺少 lib/$ABI/ 目录"; exit 1
+            fi
+            for NEED in libfreerdp_client.so librdpsnd_android.so libfreerdp2.so \
+                        libfreerdp-client2.so libwinpr2.so libcrypto.so libssl.so; do
+              echo "$LIST" | grep -q "lib/$ABI/$NEED" \
+                || { echo "ERROR: APK 的 lib/$ABI/ 缺少 $NEED"; echo "$LIST"; exit 1; }
+            done
+            echo "OK: lib/$ABI/ 全套原生库齐备"
+          done
+          # 断言不存在"孤儿 ABI 目录"（例如只含 libandroidx.graphics.path.so 的 x86_64）
+          for ABI in $(unzip -l app-debug.apk | awk '{print $4}' | grep "^lib/" | cut -d/ -f2 | sort -u); do
+            case "$ABI" in
+              arm64-v8a|armeabi-v7a) ;;
+              *) echo "ERROR: APK 出现未预期的 ABI 目录 lib/$ABI/（会诱发 ABI 误选闪退）"; exit 1 ;;
+            esac
+          done
+          echo "OK: APK 仅包含 arm64-v8a / armeabi-v7a，无孤儿 ABI 目录"
+
       - name: 上传 APK 产物
         uses: actions/upload-artifact@v4
         with:

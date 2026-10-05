@@ -11,8 +11,17 @@ android {
         applicationId = "com.accessrdp.client"
         minSdk = 21                      // 向下兼容老机型，惠及更多视障用户
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 3
+        versionName = "1.0.2"
+
+        // 【关键】只打包我们真正编译了 FreeRDP 原生库的 ABI。
+        // 若不限制，AGP 会把依赖库（如 androidx.graphics.path）的 x86/x86_64 版本
+        // 一并塞进 APK，导致 lib/x86_64/ 目录"看起来存在"但缺少 libfreerdp_client.so；
+        // Android 在选 ABI 目录时可能优先挑中该目录，System.loadLibrary 直接抛
+        // UnsatisfiedLinkError —— 表现为"安装正常、一打开就闪退"。
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {
