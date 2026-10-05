@@ -41,14 +41,20 @@ find_library(WINPR_LIB        NAMES winpr2         PATHS ${FREERDP_ROOT}/lib NO_
 find_library(SSL_LIB          NAMES ssl            PATHS ${FREERDP_ROOT}/lib NO_DEFAULT_PATH)
 find_library(CRYPTO_LIB       NAMES crypto         PATHS ${FREERDP_ROOT}/lib NO_DEFAULT_PATH)
 
+# ssl/crypto 来自按 ABI 单独编译的 OpenSSL，不一定在 FREERDP_ROOT/lib 中；
+# 找不到时留空会导致 target_link_libraries 把空串当库名而报错，故按需追加。
 set(COMMON_LIBS
   ${FREERDP_CLI_LIB}
   ${FREERDP_LIB}
   ${WINPR_LIB}
-  ${SSL_LIB}
-  ${CRYPTO_LIB}
   log
 )
+if(SSL_LIB)
+  list(APPEND COMMON_LIBS ${SSL_LIB})
+endif()
+if(CRYPTO_LIB)
+  list(APPEND COMMON_LIBS ${CRYPTO_LIB})
+endif()
 
 # ---- 主桥接：libfreerdp_client.so ----
 add_library(freerdp_client SHARED freerdp_jni.c)

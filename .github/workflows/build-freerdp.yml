@@ -1,10 +1,12 @@
 # =============================================================================
 # build-freerdp.yml
 # 在 GitHub Actions 云端机器上：
-#   1) 交叉编译 Android 版 FreeRDP（含我们打过补丁的 "android" 音频后端首选）
-#   2) 编译两个 JNI 原生库：libfreerdp_client.so（主桥接）+ librdpsnd_android.so（音频后端）
-#   3) 收集一整套 .so 到 app/src/main/jniLibs/<abi>/
-#   4) 打包可直接安装的 app-debug.apk（已集成真实 FreeRDP + 远端音频回传）
+#   1) 下载 Android NDK（腾讯镜像优先，Google / GitHub Releases 回退）
+#   2) 交叉编译 Android 版 OpenSSL（arm64-v8a + armeabi-v7a，分别安装，避免串库）
+#   3) 交叉编译 Android 版 FreeRDP（含我们打过补丁的 "android" 音频后端首选）
+#   4) 编译两个 JNI 原生库：libfreerdp_client.so（主桥接）+ librdpsnd_android.so（音频后端）
+#   5) 收集一整套 .so 到 app/src/main/jniLibs/<abi>/
+#   6) 打包可直接安装的 app-debug.apk（已集成真实 FreeRDP + 远端音频回传）
 #
 # 触发：
 #   - 推送到 main / master（自动开始编译并产出 APK 产物）
@@ -31,6 +33,7 @@ jobs:
       NDK_VERSION: android-ndk-r25c
       NDK_URL_TENCENT: https://mirrors.cloud.tencent.com/AndroidSDK/android-ndk-r25c-linux.zip
       NDK_URL_GOOGLE: https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+      NDK_URL_GITHUB: https://github.com/android/ndk/releases/download/r25c/android-ndk-r25c-linux.zip
       API: "24"
       FREERDP_REF: "2.11.0"
 
@@ -41,12 +44,17 @@ jobs:
       - name: 安装基础工具
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build make gcc python3
 
-      - name: 下载并安装 NDK（腾讯镜像优先，Google 回退）
+      - name: 下载并安装 NDK（多镜像回退，放宽超时到 10 分钟）
         run: |
           set -e
-          if ! curl -fsSL --max-time 180 "$NDK_URL_TENCENT" -o ndk.zip; then
-            curl -fsSL --max-time 180 "$NDK_URL_GOOGLE" -o ndk.zip
-          fi
+          for url in "$NDK_URL_TENCENT" "$NDK_URL_GOOGLE" "$NDK_URL_GITHUB"; do
+            echo "尝试下载 NDK: $url"
+            if curl -fsSL --max-time 600 "$url" -o ndk.zip; then
+              echo "下载成功"; break
+            fi
+            echo "该镜像失败，尝试下一个"
+          done
+          test -f ndk.zip || { echo "所有 NDK 镜像均失败"; exit 1; }
           unzip -q ndk.zip
           echo "NDK=$PWD/$NDK_VERSION" >> "$GITHUB_ENV"
           echo "TOOLCHAIN=$PWD/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64" >> "$GITHUB_ENV"
@@ -90,34 +98,40 @@ jobs:
                            r'\n\t\t{ "android", "" },\1', s, count=1)
           open(p, "w", encoding="utf-8").write(new)
           print("patched android backend, replacements =", n)
+          assert n == 1, "补丁未生效，请检查 FreeRDP 2.11.0 的 backends[] 结构"
           PY
 
       - name: 交叉编译 OpenSSL / FreeRDP / 两个 JNI 库（arm64-v8a + armeabi-v7a）
         run: |
           set -e
-          ROOT=$PWD/build
-          mkdir -p "$ROOT" && cd "$ROOT"
+          ROOT=$GITHUB_WORKSPACE/build
+          mkdir -p "$ROOT"
+          OPENSSL_SRC=$GITHUB_WORKSPACE/openssl-src
+          FREERDP_SRC=$GITHUB_WORKSPACE/FreeRDP
           PREFIX=$ROOT/freerdp-install
-          SSL_PREFIX=$ROOT/openssl
           export PATH=$TOOLCHAIN/bin:$PATH
           export ANDROID_NDK_ROOT=$NDK
 
           for ABI in arm64-v8a armeabi-v7a; do
             echo "================ ABI=$ABI ================"
             if [ "$ABI" = "arm64-v8a" ]; then
-              TARGET=android-arm64; CROSS=aarch64-linux-android-; ANDROID_ABI=arm64-v8a
+              TARGET=android-arm64; CROSS=aarch64-linux-android-
             else
-              TARGET=android-arm;    CROSS=armv7a-linux-androideabi-; ANDROID_ABI=armeabi-v7a
+              TARGET=android-arm;    CROSS=armv7a-linux-androideabi-
             fi
+            SSL_PREFIX=$ROOT/openssl-$ABI
 
-            # ---- OpenSSL ----
-            ( cd openssl-src && ./Configure $TARGET -D__ANDROID_API__=$API --prefix=$SSL_PREFIX \
-                --cross-compile-prefix=$TOOLCHAIN/bin/$CROSS- && make -j"$(nproc)" && make install_sw )
+            # ---- OpenSSL（按 ABI 分别编译安装，避免交叉 ABI 串库）----
+            echo "---- OpenSSL $TARGET ----"
+            ( cd "$OPENSSL_SRC" && \
+              ./Configure $TARGET -D__ANDROID_API__=$API --prefix=$SSL_PREFIX --libdir=lib && \
+              make clean && make -j"$(nproc)" && make install_sw )
 
             # ---- FreeRDP（关闭所有内置音频/图形后端，仅保留 rdpsnd 通道；android 后端由我们提供）----
-            rm -rf freerdp-b-$ABI && mkdir freerdp-b-$ABI && cd freerdp-b-$ABI
+            echo "---- FreeRDP $ABI ----"
+            rm -rf "$ROOT/freerdp-b-$ABI"; mkdir -p "$ROOT/freerdp-b-$ABI"
             cmake -GNinja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-              -DANDROID_ABI=$ANDROID_ABI -DANDROID_PLATFORM=android-$API \
+              -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API \
               -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release \
               -DBUILD_SHARED_LIBS=ON \
               -DWITH_OPENSSL=ON -DOPENSSL_ROOT_DIR=$SSL_PREFIX \
@@ -125,29 +139,31 @@ jobs:
               -DWITH_PULSE=OFF -DWITH_ALSA=OFF -DWITH_OSS=OFF -DWITH_OPENSLES=OFF \
               -DWITH_WINMM=OFF -DWITH_MACAUDIO=OFF -DWITH_IOSAUDIO=OFF \
               -DWITH_CUPS=OFF -DWITH_WAYLAND=OFF -DWITH_URBDRC=OFF -DWITH_GSSAPI=OFF \
-              -DWITH_SSE2=OFF -DWITH_NEON=ON \
+              -DWITH_SSE2=OFF -DWITH_NEON=OFF \
               -DWITH_SERVER=OFF -DBUILD_TESTING=OFF -DWITH_SAMPLE=OFF \
               -DWITH_CLI=OFF -DWITH_MANPAGES=OFF -DWITH_PROXY=OFF \
-              -DWITH_CHANNELS=ON ..
-            cmake --build . -j"$(nproc)"
-            cmake --install .
-            cd ..
+              -DWITH_CHANNELS=ON "$FREERDP_SRC"
+            cmake --build "$ROOT/freerdp-b-$ABI" -j"$(nproc)"
+            cmake --install "$ROOT/freerdp-b-$ABI"
 
             # ---- 我们的两个 JNI 库 ----
-            rm -rf bridge-b-$ABI && mkdir bridge-b-$ABI && cd bridge-b-$ABI
+            echo "---- JNI bridge $ABI ----"
+            rm -rf "$ROOT/bridge-b-$ABI"; mkdir -p "$ROOT/bridge-b-$ABI"
             cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-              -DANDROID_ABI=$ANDROID_ABI -DANDROID_PLATFORM=android-$API \
-              -DFREERDP_ROOT=$PREFIX -DCMAKE_INSTALL_PREFIX=$ROOT/bridge-out .
-            cmake --build .
-            cd ..
+              -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API \
+              -DFREERDP_ROOT=$PREFIX -DCMAKE_INSTALL_PREFIX=$ROOT/bridge-out \
+              "$GITHUB_WORKSPACE/app/src/main/jni"
+            cmake --build "$ROOT/bridge-b-$ABI"
 
             # ---- 收集所有 .so ----
-            DST=$GITHUB_WORKSPACE/app/src/main/jniLibs/$ANDROID_ABI
+            DST=$GITHUB_WORKSPACE/app/src/main/jniLibs/$ABI
             mkdir -p "$DST"
-            cp -v bridge-b-$ABI/libfreerdp_client.so "$DST/"
-            cp -v bridge-b-$ABI/librdpsnd_android.so "$DST/"
-            cp -v $PREFIX/lib/*.so "$DST/" 2>/dev/null || true
-            echo "---- collected $ANDROID_ABI ----"
+            cp -v "$ROOT/bridge-b-$ABI"/libfreerdp_client.so "$DST/" || true
+            cp -v "$ROOT/bridge-b-$ABI"/librdpsnd_android.so "$DST/" || true
+            cp -v "$PREFIX"/lib/*.so "$DST/" 2>/dev/null || true
+            cp -v "$SSL_PREFIX"/lib/libssl.so* "$DST/" 2>/dev/null || true
+            cp -v "$SSL_PREFIX"/lib/libcrypto.so* "$DST/" 2>/dev/null || true
+            echo "---- collected $ABI ----"
             ls -la "$DST"
           done
 
@@ -159,12 +175,14 @@ jobs:
           java-version: '17'
 
       - name: 安装 Android SDK 并编译 debug APK（可直接安装体验）
+        uses: android-actions/setup-android@v3
+
+      - name: 安装编译所需 SDK 包并打包 APK
         run: |
           set -e
-          yes | sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          export ANDROID_HOME=$ANDROID_HOME
-          export JAVA_HOME=$JAVA_HOME
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk app-debug.apk
 
