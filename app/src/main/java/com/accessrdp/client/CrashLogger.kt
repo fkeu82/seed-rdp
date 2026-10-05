@@ -90,7 +90,9 @@ object CrashLogger {
             pw.println("线程: ${thread.name}")
             pw.println("机型: ${Build.MANUFACTURER} ${Build.MODEL}")
             pw.println("Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
-            pw.println("ABI: ${Build.SUPPORTED_ABIS.joinToString(", ")}")
+            pw.println("设备支持的 ABI: ${Build.SUPPORTED_ABIS.joinToString(", ")}")
+            pw.println("设备首选 ABI: ${Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}")
+            pw.println("APK 内包含的 ABI: ${apkAbis(context).joinToString(", ")}")
             pw.println("App 版本: ${appVersion(context)}")
             pw.println("原生库已加载: ${com.accessrdp.client.jni.FreerdpJni.isLibraryLoaded}")
             pw.println("音频后端已加载: ${com.accessrdp.client.jni.FreerdpJni.isAudioBackendLoaded}")
@@ -111,5 +113,20 @@ object CrashLogger {
         "${pi.versionName} (${pi.versionCode})"
     } catch (e: Exception) {
         "unknown"
+    }
+
+    /**
+     * APK 内实际携带的 ABI 目录。
+     *
+     * 排查「ABI 误选闪退」的关键证据：若设备首选 ABI 不在本列表里，
+     * 那 System.loadLibrary 必然失败——这正是"装上能打开、一用原生库就闪退"的典型成因。
+     */
+    private fun apkAbis(context: Context): List<String> = try {
+        context.applicationInfo.nativeLibraryDir
+            ?.let { File(it).parentFile?.listFiles()?.mapNotNull { f -> f.name } }
+            ?.sorted()
+            ?: Build.SUPPORTED_ABIS.toList()
+    } catch (e: Exception) {
+        Build.SUPPORTED_ABIS.toList()
     }
 }

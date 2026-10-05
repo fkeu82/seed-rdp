@@ -180,6 +180,10 @@ jobs:
             copy_libs "$PREFIX/lib"           # libfreerdp2 / libfreerdp-client2 / libwinpr2 ...
             copy_libs "$SSL_PREFIX/lib"       # libssl / libcrypto
 
+            # 清理噪音库：FreeRDP 上游自带的 libfreerdp-android.so（示例用，仅导出
+            # JNI_OnLoad/OnUnload，无任何 Java 类加载它），留着只会让 APK 无谓变大。
+            rm -f "$DST/libfreerdp-android.so"
+
             echo "---- collected $ABI ----"
             ls -la "$DST"
 
