@@ -6,6 +6,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- 崩溃日志写入公共「下载」目录。Android 10+ 走 MediaStore 不需要权限；
+         Android 9 及以下需要该权限，故限定 maxSdkVersion=28，避免在新系统上申请敏感权限。 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
     <application
         android:name=".AccessRdpApp"
         android:allowBackup="true"

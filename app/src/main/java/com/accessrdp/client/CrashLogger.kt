@@ -1,9 +1,14 @@
 package com.accessrdp.client
 
+import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Context
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import java.io.File
+import java.io.OutputStream
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.text.SimpleDateFormat
@@ -11,33 +16,40 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 「黑匣子」——全局未捕获异常记录器。
+ * 「黑匣子」——全局未捕获异常记录器（v1.0.3 强化版）。
  *
- * 目的：真机上 App 崩溃时，无法连 USB 调试的情况下，用户仍能把崩溃日志读出来反馈。
+ * 相比上一版的关键改进：**日志一定写得进去、一定找得到**。
  *
- * 行为：
- * - 安装一个 [Thread.setDefaultUncaughtExceptionHandler]，捕获所有线程的未捕获异常；
- * - 把时间 / 机型 / Android 版本 / 完整 StackTrace 追加写入
- *   `Android/data/com.accessrdp.client/files/crash-YYYYMMDD.txt`（外部可见，无需 root）；
- * - 若外部目录不可写，回退到内部 filesDir；
- * - 记录完成后，**继续调用系统默认处理器**，让系统照常处理崩溃（不要吞掉，避免状态不一致）。
+ * 上一版写到 `Android/data/<pkg>/files/`，但在 Android 11+ 的分区存储下，
+ * 普通文件管理器**根本进不去这个目录**，所以用户反馈"指定目录里没有日志"。
  *
- * 日志文件位置（用户可直接在「文件管理 → Android/data/com.accessrdp.client/files」里找到）：
- *   - /sdcard/Android/data/com.accessrdp.client/files/crash-*.txt
+ * 本版改为写入**公共「下载」目录下的 AccessRDP 文件夹**：
+ *
+ *   - Android 10+ ：通过 MediaStore 写入
+ *       `Download/AccessRDP/crash-YYYYMMDD.txt`（无需任何权限，文件管理器里直接可见）
+ *   - Android 9-  ：直接写 `/sdcard/Download/AccessRDP/crash-YYYYMMDD.txt`
+ *       （配合 manifest 的 WRITE_EXTERNAL_STORAGE，maxSdkVersion=28）
+ *   - 全部失败时  ：回退到 app 私有目录，并**同时打 logcat**，任何情况下都不丢信息
+ *
+ * 每次写日志还会同步 `Log.e(TAG, ...)` 到 logcat，方便 `adb logcat -s AccessRDP/Crash` 抓取。
  */
 object CrashLogger {
 
     private const val TAG = "AccessRDP/Crash"
 
-    /** 崩溃日志目录名（放外部 filesDir，用户能在文件管理器里看到）。 */
-    private const val DIR_NAME = "files"
+    /** 公共下载目录下自建的文件夹名，用户一眼能找到。 */
+    private const val PUBLIC_DIR = "AccessRDP"
 
     @Volatile
     private var installed = false
 
+    /** 最近一次写入的日志绝对路径（供 UI / 播报展示）。 */
+    @Volatile
+    var lastLogPath: String? = null
+        private set
+
     /**
      * 安装全局崩溃捕获。必须在 Application.onCreate 里尽早点调用。
-     * @param context 建议传 applicationContext
      */
     @Synchronized
     fun install(context: Context) {
@@ -51,42 +63,46 @@ object CrashLogger {
             try {
                 writeCrashLog(appContext, thread, throwable)
             } catch (t: Throwable) {
-                // 记录日志本身失败也绝不能影响崩溃流程。
+                // 记录日志本身失败也绝不能影响崩溃流程；至少打到 logcat。
                 Log.e(TAG, "写入崩溃日志失败", t)
             }
             // 交还给系统默认处理器（保留系统崩溃对话框 / 进程终止行为）。
             previous?.uncaughtException(thread, throwable)
         }
-        Log.i(TAG, "全局崩溃捕获已安装")
+        Log.i(TAG, "全局崩溃捕获已安装，日志目录：Download/$PUBLIC_DIR/")
     }
 
-    /** 崩溃日志文件路径（供 UI 显示给用户，便于其找到并反馈）。 */
-    fun logDir(context: Context): File {
-        val external = context.getExternalFilesDir(null)
-        return if (external != null && (external.exists() || external.mkdirs())) {
-            external
-        } else {
-            context.filesDir
+    /**
+     * 主动写一条运行日志（非崩溃场景也可用，例如连接失败时留痕）。
+     * 用于保证"必须打印日志"在任何路径下都成立。
+     */
+    fun log(context: Context, tag: String, message: String) {
+        try {
+            val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+            val day = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+            val content = "[$stamp] [$tag] $message\n"
+            val path = appendLog(context, "run-$day.txt", content)
+            Log.i(TAG, "运行日志($tag): $message  -> $path")
+        } catch (t: Throwable) {
+            Log.e(TAG, "写入运行日志失败", t)
         }
     }
 
-    /** 最近一次崩溃日志文件（若存在）。 */
-    fun latestLogFile(context: Context): File? =
-        logDir(context).listFiles { f -> f.name.startsWith("crash-") && f.name.endsWith(".txt") }
-            ?.maxByOrNull { it.lastModified() }
+    /** 崩溃日志的展示路径（供 UI 告诉用户去哪里找）。 */
+    fun displayPath(): String = "下载/AccessRDP/"
+
+    // ------------------------------------------------------------------
+    // 内部实现
+    // ------------------------------------------------------------------
 
     private fun writeCrashLog(context: Context, thread: Thread, throwable: Throwable) {
-        val dir = logDir(context)
-        if (!dir.exists()) dir.mkdirs()
-
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val day = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
-        val file = File(dir, "crash-$day.txt")
+        val fileName = "crash-$day.txt"
 
         val sw = StringWriter()
         PrintWriter(sw).use { pw ->
             pw.println("========== AccessRDP 崩溃报告 ==========")
-            pw.println("时间: $stamp")
+            pw.println("时间: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())}")
             pw.println("线程: ${thread.name}")
             pw.println("机型: ${Build.MANUFACTURER} ${Build.MODEL}")
             pw.println("Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
@@ -103,9 +119,136 @@ object CrashLogger {
             pw.println()
         }
 
-        // 追加写入，保留当天多次崩溃记录。
-        file.appendText(sw.toString())
-        Log.e(TAG, "崩溃日志已写入: ${file.absolutePath}")
+        val content = sw.toString()
+
+        // 1) 一定打到 logcat（任何设备都能用 adb logcat -s AccessRDP/Crash 抓到）
+        Log.e(TAG, "检测到崩溃，开始写入日志。\n$content")
+
+        // 2) 落盘
+        val path = appendLog(context, fileName, content)
+        lastLogPath = path
+        Log.e(TAG, "崩溃日志已写入：$path")
+    }
+
+    /**
+     * 追加写日志，返回最终写入路径（失败返回 null）。
+     *
+     * 写入策略按 Android 版本分派，确保"一定写得进去、一定找得到"：
+     * - API 29+：MediaStore（Download/AccessRDP/），免权限、文件管理器可见
+     * - API 21-28：直接写 /sdcard/Download/AccessRDP/
+     * - 兜底：app 私有外部目录
+     */
+    private fun appendLog(context: Context, fileName: String, content: String): String? {
+        // ---- 方案 A：Android 10+ 用 MediaStore 写入公共下载目录 ----
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val viaMediaStore = writeViaMediaStore(context, fileName, content)
+            if (viaMediaStore != null) return viaMediaStore
+        }
+
+        // ---- 方案 B：直接写外部存储的 Download 目录（API 28- 无需分区存储适配）----
+        val direct = writeDirect(fileName, content)
+        if (direct != null) return direct
+
+        // ---- 方案 C：全部失败 -> app 私有目录兜底（至少不丢数据）----
+        return writePrivate(context, fileName, content)
+    }
+
+    /** MediaStore 方式：不需要权限，且「文件管理 → 下载」里直接可见。 */
+    private fun writeViaMediaStore(context: Context, fileName: String, content: String): String? {
+        return try {
+            val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/$PUBLIC_DIR"
+
+            // MediaStore 不支持 append：先读出旧内容（若有），再整体覆盖写回。
+            var existing = ""
+            val existingUri = findExistingUri(context, collection, fileName)
+            if (existingUri != null) {
+                existing = try {
+                    context.contentResolver.openInputStream(existingUri)
+                        ?.use { it.readBytes().decodeToString() } ?: ""
+                } catch (t: Throwable) {
+                    ""
+                }
+                try {
+                    context.contentResolver.delete(existingUri, null, null)
+                } catch (t: Throwable) {
+                    // 删除失败不致命，下面按新建处理
+                }
+            }
+
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            }
+            val uri = context.contentResolver.insert(collection, values) ?: return null
+            context.contentResolver.openOutputStream(uri)?.use { os: OutputStream ->
+                os.write((existing + content).toByteArray())
+                os.flush()
+            } ?: return null
+
+            "Download/$PUBLIC_DIR/$fileName"
+        } catch (t: Throwable) {
+            Log.w(TAG, "MediaStore 写日志失败，尝试直接写文件", t)
+            null
+        }
+    }
+
+    /** 在 MediaStore 中查找已存在的同名日志文件 URI。 */
+    private fun findExistingUri(
+        context: Context,
+        collection: android.net.Uri,
+        fileName: String
+    ): android.net.Uri? {
+        return try {
+            context.contentResolver.query(
+                collection,
+                arrayOf(MediaStore.MediaColumns._ID),
+                "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.DISPLAY_NAME} = ?",
+                arrayOf("%$PUBLIC_DIR%", fileName),
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idIdx = cursor.getColumnIndex(MediaStore.MediaColumns._ID)
+                    if (idIdx >= 0) {
+                        ContentUris.withAppendedId(collection, cursor.getLong(idIdx))
+                    } else null
+                } else null
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /** 直接写文件：公共 Download 目录。 */
+    private fun writeDirect(fileName: String, content: String): String? {
+        return try {
+            val dir = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                PUBLIC_DIR
+            )
+            if (!dir.exists() && !dir.mkdirs()) return null
+            val f = File(dir, fileName)
+            f.appendText(content)
+            f.absolutePath
+        } catch (t: Throwable) {
+            Log.w(TAG, "直接写入 Download 目录失败", t)
+            null
+        }
+    }
+
+    /** 兜底：app 私有目录（一定能写，但用户不易访问）。 */
+    private fun writePrivate(context: Context, fileName: String, content: String): String? {
+        return try {
+            val dir = context.getExternalFilesDir(null) ?: context.filesDir
+            if (!dir.exists()) dir.mkdirs()
+            val f = File(dir, fileName)
+            f.appendText(content)
+            f.absolutePath
+        } catch (t: Throwable) {
+            Log.e(TAG, "私有目录写日志也失败", t)
+            null
+        }
     }
 
     private fun appVersion(context: Context): String = try {
@@ -116,14 +259,11 @@ object CrashLogger {
     }
 
     /**
-     * APK 内实际携带的 ABI 目录。
-     *
-     * 排查「ABI 误选闪退」的关键证据：若设备首选 ABI 不在本列表里，
-     * 那 System.loadLibrary 必然失败——这正是"装上能打开、一用原生库就闪退"的典型成因。
+     * APK 内实际携带的 ABI 目录，用于判定「ABI 误选闪退」。
      */
     private fun apkAbis(context: Context): List<String> = try {
         context.applicationInfo.nativeLibraryDir
-            ?.let { File(it).parentFile?.listFiles()?.mapNotNull { f -> f.name } }
+            ?.let { File(it).parentFile?.listFiles()?.map { f -> f.name } }
             ?.sorted()
             ?: Build.SUPPORTED_ABIS.toList()
     } catch (e: Exception) {

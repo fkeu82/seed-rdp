@@ -1,5 +1,6 @@
 package com.accessrdp.client
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.accessrdp.client.keymodel.KeyAction
@@ -41,6 +42,10 @@ enum class ConnectionState { DISCONNECTED, CONNECTING, CONNECTED }
  */
 class RdpViewModel : ViewModel() {
 
+    private companion object {
+        const val TAG = "AccessRDP/ViewModel"
+    }
+
     private val manager = StickyKeyManager()
 
     private val _useRealNative = MutableStateFlow(false)
@@ -79,18 +84,18 @@ class RdpViewModel : ViewModel() {
 
         _announcement.value = when {
             !nativeLoaded -> {
-                // 明确告知视障用户当前处于降级模式，以及可查看日志的位置。
+                // 明确告知视障用户当前处于降级模式。
                 val detail = FreerdpJni.lastLoadError
                 if (detail.isNullOrBlank()) {
-                    "音频库加载失败，已进入演示模式：可完整体验键盘与数据回显"
+                    "音频库加载失败，已进入演示模式"
                 } else {
                     "音频库加载失败，已进入演示模式。原因：$detail"
                 }
             }
             !FreerdpJni.isAudioBackendLoaded -> {
-                "已连接 FreeRDP 原生库，但音频后端未加载，远端声音可能不可用：${FreerdpJni.lastLoadError ?: ""}"
+                "已连接 FreeRDP 原生库，但音频后端未加载，远端声音可能不可用"
             }
-            else -> "已加载 FreeRDP 原生库，连接后将进入真实远程桌面"
+            else -> null   // 一切正常时不播报，保持界面对读屏干净
         }
     }
 
@@ -131,15 +136,34 @@ class RdpViewModel : ViewModel() {
     fun connect(config: ConnectionConfig) {
         viewModelScope.launch(Dispatchers.IO) {
             _connection.value = ConnectionState.CONNECTING
-            val result = transport.connect(config)
+            // 「防弹衣」：真实发起网络连接时，底层 FreeRDP 可能因各种原因（IP 不通、
+            // 目标主机拒绝、证书异常、原生段断言等）失败甚至抛错。这里双层兜底，
+            // 保证无论发生什么都不会让异常冒泡到主线程造成闪退。
+            val result: ConnectionResult = try {
+                transport.connect(config)
+            } catch (e: UnsatisfiedLinkError) {
+                // 原生库符号缺失（部分 ABI / 裁剪库的典型表现）
+                Log.e(TAG, "连接时原生符号缺失", e)
+                ConnectionResult.Failure("原生库不完整：${e.message}")
+            } catch (e: Throwable) {
+                // 兜底所有异常（含 Error），绝不让它崩 App
+                Log.e(TAG, "连接发生异常", e)
+                ConnectionResult.Failure(e.javaClass.simpleName + ": " + e.message)
+            }
+
             _connection.value = if (result is ConnectionResult.Success) {
                 ConnectionState.CONNECTED
             } else {
                 ConnectionState.DISCONNECTED
             }
             when (result) {
-                is ConnectionResult.Success -> _announcement.value = "已连接到 ${config.host}"
-                is ConnectionResult.Failure -> _announcement.value = "连接失败：${result.reason}"
+                is ConnectionResult.Success ->
+                    _announcement.value = "已连接，键盘已显示"
+                is ConnectionResult.Failure -> {
+                    // 统一失败话术（用户要求）：不暴露技术细节，只给可执行的提示。
+                    Log.w(TAG, "连接失败原因：${result.reason}")
+                    _announcement.value = "连接失败，请检查主机和端口"
+                }
             }
         }
     }

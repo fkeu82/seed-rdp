@@ -32,6 +32,18 @@ class AccessRdpApp : Application() {
             Log.e("AccessRDP/App", "预加载原生库异常", t)
         }
 
+        // 2.5) 写一条启动日志，确认「日志真的打印出来了」。
+        //      用户可在「文件管理 → 下载 → AccessRDP」看到 run-当天.txt。
+        try {
+            CrashLogger.log(
+                this, "启动",
+                "原生库=${FreerdpJni.isLibraryLoaded} 音频后端=${FreerdpJni.isAudioBackendLoaded} " +
+                        "错误=${FreerdpJni.lastLoadError ?: "无"}"
+            )
+        } catch (t: Throwable) {
+            Log.e("AccessRDP/App", "写启动日志失败", t)
+        }
+
         // 3) 告诉 FreeRDP 原生库目录（仅当主库已成功加载时才调用，
         //    否则调用 external 会抛 UnsatisfiedLinkError）。
         if (FreerdpJni.isLibraryLoaded) {

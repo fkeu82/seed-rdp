@@ -11,8 +11,8 @@ android {
         applicationId = "com.accessrdp.client"
         minSdk = 21                      // 向下兼容老机型，惠及更多视障用户
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 4
+        versionName = "1.0.3"
 
         // 【关键】只打包我们真正编译了 FreeRDP 原生库的 ABI。
         // 若不限制，AGP 会把依赖库（如 androidx.graphics.path）的 x86/x86_64 版本
