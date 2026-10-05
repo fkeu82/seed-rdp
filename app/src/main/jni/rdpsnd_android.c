@@ -110,7 +110,14 @@ static JNIEnv* get_env(int* need_detach)
 	if (res == JNI_EDETACHED)
 	{
 		if ((*g_vm)->AttachCurrentThread(g_vm, &env, NULL) == JNI_OK)
-			*need_detach = 1;
+			*need_detach = (env != NULL) ? 1 : 0;
+	}
+	/* 兜底：即使 attach 报告成功，env 仍可能为 NULL；
+	 * 带着 NULL env 调用任何 JNI 函数都是未定义行为（会直接崩溃）。 */
+	if (env == NULL && *need_detach)
+	{
+		(*g_vm)->DetachCurrentThread(g_vm);
+		*need_detach = 0;
 	}
 	return env;
 }
