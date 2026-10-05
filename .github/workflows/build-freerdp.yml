@@ -199,17 +199,49 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: 安装 Android SDK 并编译 debug APK（可直接安装体验）
-        uses: android-actions/setup-android@v3
-
+      # 说明：不再使用 android-actions/setup-android@v3。
+      # 该 action 会执行 `sdkmanager tools`，而新版 SDK 已移除 "tools" 包，
+      # 导致其自身以 exit 1 崩溃（与我们的构建无关）。GitHub ubuntu runner
+      # 已预装 Android SDK，直接使用其 cmdline-tools 即可。
       - name: 安装编译所需 SDK 包并打包 APK
         run: |
           set -e
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+          # 1) 定位 Android SDK
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+
+          # 2) 定位 sdkmanager（不同 runner 镜像路径略有差异）
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            for c in "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+                     "$SDK/cmdline-tools/bin/sdkmanager" \
+                     "$SDK/tools/bin/sdkmanager"; do
+              [ -x "$c" ] && SDKMANAGER="$c" && break
+            done
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            # 兜底：确保 cmdline-tools 存在（从 runner 自带位置找）
+            SDKMANAGER="$(find "$SDK" -name sdkmanager -type f 2>/dev/null | head -1)"
+          fi
+          echo "SDKMANAGER=$SDKMANAGER"
+          test -n "$SDKMANAGER" || { echo "找不到 sdkmanager"; ls -la "$SDK" || true; exit 1; }
+
+          # 3) 接受许可并安装所需平台/构建工具（用 yes 自动确认）
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --sdk_root="$SDK" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+          # 4) 写 local.properties，确保 Gradle 找到 SDK
+          echo "sdk.dir=$SDK" > local.properties
+
+          # 5) 打包
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug --no-daemon --stacktrace
           cp app/build/outputs/apk/debug/app-debug.apk app-debug.apk
+          ls -la app-debug.apk
 
       - name: 上传 APK 产物
         uses: actions/upload-artifact@v4
