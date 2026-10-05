@@ -15,6 +15,12 @@
  * 本文件只负责“让 FreeRDP 把音频后端加载起来”。
  */
 
+/* setenv() 的 POSIX 声明必须在任何头文件之前引入。Android bionic 默认已暴露，
+ * 这里显式声明以在严格 C 标准模式下也稳定可用。 */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <jni.h>
 #include <string.h>
 #include <stdlib.h>
@@ -35,9 +41,9 @@ static freerdp* g_instance = NULL;
 /* AudioRedirect.setEnabled(boolean) 的 jmethodID（JNI_OnLoad 时缓存）。 */
 static jmethodID g_setEnabled = NULL;
 
-/* 键盘 flags（与 FreeRDP KBD_FLAGS 对齐） */
-#define KBD_FLAGS_EXTENDED 0x0100
-#define KBD_FLAGS_RELEASE  0x8000
+/* 键盘扫描码：扩展位来自 Kotlin 约定的 0xE000；RDP 侧的 KBDEXT 由
+ * MAKE_RDP_SCANCODE 宏（freerdp/scancode.h，经 input.h 引入）自动处理。 */
+#define ACCESSRDP_SCANCODE_EXT_MASK 0xE000
 
 /* ------------------------------------------------------------------ */
 /* JNI 装载：缓存 JVM 与回调方法                                       */
@@ -171,11 +177,28 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeDisconnect(JNIEnv* env, jclass cl
 /* ------------------------------------------------------------------ */
 /* 键盘：核心无障碍组合键通路                                          */
 /* ------------------------------------------------------------------ */
-static void send_key(UINT16 scancode, UINT16 base_flags)
+/* 发送一次键盘事件。
+ *
+ * FreeRDP 2.x 的 freerdp_input_send_keyboard_event_ex(rdpInput*, BOOL down, UINT32 rdp_scancode)
+ * 的第三个参数是“已按 RDP 约定组装好的 rdp_scancode”，不是裸扫描码：
+ *   - 低 8 位 = 扫描码（RDP_SCANCODE_CODE）
+ *   - KBDEXT(0x0100) 位 = 是否扩展键（RDP_SCANCODE_EXTENDED）
+ * down 单独控制按下(true)/抬起(false)，函数内部会自行加上 KBD_FLAGS_DOWN/RELEASE
+ * 与 KBD_FLAGS_EXTENDED。故这里用 MAKE_RDP_SCANCODE 组装，绝不能再自己塞 flags。
+ *
+ * @param rdpScanCode 来自 Kotlin：低 8 位扫描码，0xE000 位表示扩展键（如方向键/Insert 等）
+ * @param down        TRUE=按下，FALSE=抬起
+ */
+static void send_key(jint rdpScanCode, BOOL down)
 {
 	if (g_instance == NULL || g_instance->input == NULL)
 		return;
-	freerdp_input_send_keyboard_event_ex(g_instance->input, base_flags, scancode);
+
+	UINT16 code     = (UINT16)(rdpScanCode & 0x00FF);
+	BOOL   extended = (rdpScanCode & ACCESSRDP_SCANCODE_EXT_MASK) ? TRUE : FALSE;
+	UINT32 rdpScancode = (UINT32)MAKE_RDP_SCANCODE(code, extended);
+
+	freerdp_input_send_keyboard_event_ex(g_instance->input, down, rdpScancode);
 }
 
 JNIEXPORT void JNICALL
@@ -183,9 +206,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_sendKeyDown(JNIEnv* env, jclass clazz, 
 {
 	(void)env;
 	(void)clazz;
-	UINT16 scancode = (UINT16)(rdpScanCode & 0x00FF);
-	UINT16 flags    = (rdpScanCode & 0xE000) ? KBD_FLAGS_EXTENDED : 0;
-	send_key(scancode, flags); /* 0 = 按下 */
+	send_key(rdpScanCode, TRUE); /* TRUE = 按下 */
 }
 
 JNIEXPORT void JNICALL
@@ -193,9 +214,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_sendKeyUp(JNIEnv* env, jclass clazz, ji
 {
 	(void)env;
 	(void)clazz;
-	UINT16 scancode = (UINT16)(rdpScanCode & 0x00FF);
-	UINT16 flags    = (rdpScanCode & 0xE000) ? KBD_FLAGS_EXTENDED : 0;
-	send_key(scancode, (UINT16)(flags | KBD_FLAGS_RELEASE));
+	send_key(rdpScanCode, FALSE); /* FALSE = 抬起 */
 }
 
 /* ------------------------------------------------------------------ */

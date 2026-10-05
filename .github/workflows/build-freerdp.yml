@@ -156,16 +156,40 @@ jobs:
               -DFREERDP_ROOT=$PREFIX -DOPENSSL_ROOT=$SSL_PREFIX -DCMAKE_INSTALL_PREFIX=$ROOT/bridge-out
             cmake --build "$ROOT/bridge-b-$ABI"
 
-            # ---- 收集所有 .so ----
+            # ---- 收集所有 .so 到 jniLibs/<abi>/ ----
+            # 注意：FreeRDP 安装出来的多为“版本化 + 软链”形式：
+            #   libfreerdp2.so -> libfreerdp2.so.2.11.0
+            # Android 打包时软链会变成坏链接，且运行时需要真实文件；
+            # 故统一用 cp -L 解引用软链，并同时拷贝 .so 与 .so.* 两种名字。
             DST=$GITHUB_WORKSPACE/app/src/main/jniLibs/$ABI
             mkdir -p "$DST"
-            cp -v "$ROOT/bridge-b-$ABI"/libfreerdp_client.so "$DST/" || true
-            cp -v "$ROOT/bridge-b-$ABI"/librdpsnd_android.so "$DST/" || true
-            cp -v "$PREFIX"/lib/*.so "$DST/" 2>/dev/null || true
-            cp -v "$SSL_PREFIX"/lib/libssl.so* "$DST/" 2>/dev/null || true
-            cp -v "$SSL_PREFIX"/lib/libcrypto.so* "$DST/" 2>/dev/null || true
+
+            # 从给定目录拷贝所有 .so / .so.*（解引用软链，保持文件名）
+            copy_libs() {
+              local dir="$1"
+              [ -d "$dir" ] || return 0
+              shopt -s nullglob
+              for f in "$dir"/*.so "$dir"/*.so.*; do
+                [ -e "$f" ] || continue   # 跳过失效软链
+                cp -Lf "$f" "$DST/$(basename "$f")"
+              done
+              shopt -u nullglob
+            }
+
+            copy_libs "$ROOT/bridge-b-$ABI"   # libfreerdp_client.so / librdpsnd_android.so
+            copy_libs "$PREFIX/lib"           # libfreerdp2 / libfreerdp-client2 / libwinpr2 ...
+            copy_libs "$SSL_PREFIX/lib"       # libssl / libcrypto
+
             echo "---- collected $ABI ----"
             ls -la "$DST"
+
+            # 校验关键库齐全（缺失则立刻失败，避免打出“残废 APK”）
+            for need in libfreerdp_client.so librdpsnd_android.so libfreerdp2.so \
+                        libfreerdp-client2.so libwinpr2.so; do
+              if [ ! -f "$DST/$need" ]; then
+                echo "ERROR: $ABI 缺少 $need"; ls -la "$DST"; exit 1
+              fi
+            done
           done
 
       # ---- 打包 APK（含真实 FreeRDP + 音频后端）----

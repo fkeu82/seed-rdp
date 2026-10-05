@@ -30,8 +30,8 @@ message(STATUS "FREERDP_ROOT = ${FREERDP_ROOT}")
 # FreeRDP 安装后的头文件路径
 include_directories(
   ${FREERDP_ROOT}/include
-  ${FREERDP_ROOT}/include/freerdp
-  ${FREERDP_ROOT}/include/winpr
+  ${FREERDP_ROOT}/include/freerdp2
+  ${FREERDP_ROOT}/include/winpr2
 )
 
 # 定位依赖库。
@@ -78,8 +78,8 @@ endif()
 add_library(freerdp_client SHARED freerdp_jni.c)
 target_include_directories(freerdp_client PRIVATE
   ${FREERDP_ROOT}/include
-  ${FREERDP_ROOT}/include/freerdp
-  ${FREERDP_ROOT}/include/winpr
+  ${FREERDP_ROOT}/include/freerdp2
+  ${FREERDP_ROOT}/include/winpr2
 )
 target_link_libraries(freerdp_client ${COMMON_LIBS})
 set_target_properties(freerdp_client PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -90,8 +90,8 @@ set_target_properties(freerdp_client PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE
 add_library(rdpsnd_android SHARED rdpsnd_android.c)
 target_include_directories(rdpsnd_android PRIVATE
   ${FREERDP_ROOT}/include
-  ${FREERDP_ROOT}/include/freerdp
-  ${FREERDP_ROOT}/include/winpr
+  ${FREERDP_ROOT}/include/freerdp2
+  ${FREERDP_ROOT}/include/winpr2
 )
 target_link_libraries(rdpsnd_android ${COMMON_LIBS})
 set_target_properties(rdpsnd_android PROPERTIES
