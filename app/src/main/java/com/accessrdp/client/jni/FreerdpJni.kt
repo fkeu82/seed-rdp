@@ -1,5 +1,6 @@
 package com.accessrdp.client.jni
 
+import android.util.Log
 import com.accessrdp.client.keymodel.KeyAction
 import com.accessrdp.client.keymodel.KeyActionType
 
@@ -16,8 +17,16 @@ import com.accessrdp.client.keymodel.KeyActionType
  *
  * 接入真实 FreeRDP 时，只需提供编译好的 `libfreerdp_client.so` 放到 apk 的 jniLibs 目录，
  * 并在 C 侧实现下方所有 `external` 函数即可，Kotlin 代码无需改动。
+ *
+ * ⚠️ 防御性编程原则（避免真机闪退）：
+ * - 任何 `System.loadLibrary` 失败都必须被吞掉并回退到演示模式，绝不让 App 崩溃；
+ * - 任何 `external` 原生调用都必须包裹 try/catch（UnsatisfiedLinkError / Throwable），
+ *   因为原生库加载成功 ≠ 每个符号都能解析，缺失时会抛 UnsatisfiedLinkError；
+ * - 提供 [lastLoadError] 供 UI 用 TalkBack 播报失败原因。
  */
 object FreerdpJni {
+
+    private const val TAG = "AccessRDP/JNI"
 
     private const val LIB_NAME = "freerdp_client"
     private const val LIB_AUDIO = "rdpsnd_android"
@@ -26,26 +35,63 @@ object FreerdpJni {
     var isLibraryLoaded: Boolean = false
         private set
 
+    /** 音频后端（librdpsnd_android.so）是否已成功加载。缺失时只是没有声音，不影响主流程。 */
+    var isAudioBackendLoaded: Boolean = false
+        private set
+
+    /** 最近一次加载/调用失败的描述（供 UI 播报）。null 表示无错误。 */
+    @Volatile
+    var lastLoadError: String? = null
+        private set
+
     /**
-     * 尝试加载原生库。返回 false 表示未找到 .so（演示/未集成 FreeRDP 时属正常）。
-     * 主桥接 [LIB_NAME] 负责连接/键盘；[LIB_AUDIO] 是 FreeRDP 的音频输出后端，
-     * 须一并加载，否则 FreeRDP 在连接时无法找到它来接管“远端声音回传”。
+     * 尝试加载原生库。返回 false 表示未找到 .so 或加载失败（演示/未集成 FreeRDP 时属正常）。
+     *
+     * 安全气囊：任何 `UnsatisfiedLinkError`（甚至底层崩溃前的 `Throwable`）都被捕获，
+     * 绝不向上抛出导致 App 闪退。主桥接 [LIB_NAME] 负责连接/键盘；[LIB_AUDIO] 是
+     * FreeRDP 的音频输出后端，须一并加载，否则 FreeRDP 在连接时无法找到它来接管“远端声音回传”。
      */
+    @Synchronized
     fun load(): Boolean {
         if (isLibraryLoaded) return true
-        return try {
+
+        // ---- 1) 主桥接库：决定是否能用“真实连接”模式 ----
+        try {
             System.loadLibrary(LIB_NAME)
-            try {
-                System.loadLibrary(LIB_AUDIO)
-            } catch (_: UnsatisfiedLinkError) {
-                // 音频后端缺失时仍允许连接（只是没有声音），不阻断主流程。
-            }
             isLibraryLoaded = true
-            true
+            lastLoadError = null
         } catch (e: UnsatisfiedLinkError) {
+            // 最常见：APK 内缺少对应 ABI 的 .so，或某个依赖库符号无法解析。
             isLibraryLoaded = false
-            false
+            isAudioBackendLoaded = false
+            lastLoadError = "音频库加载失败（主桥接）：${e.message}"
+            Log.e(TAG, "loadLibrary($LIB_NAME) 失败", e)
+            return false
+        } catch (e: Throwable) {
+            // 兜底：LinkageError / SecurityException 等一律吞掉，避免启动即崩。
+            isLibraryLoaded = false
+            isAudioBackendLoaded = false
+            lastLoadError = "音频库加载失败（主桥接）：${e.javaClass.simpleName}: ${e.message}"
+            Log.e(TAG, "loadLibrary($LIB_NAME) 异常", e)
+            return false
         }
+
+        // ---- 2) 音频后端库：缺失只降级为“无声”，不阻断连接 ----
+        try {
+            System.loadLibrary(LIB_AUDIO)
+            isAudioBackendLoaded = true
+        } catch (e: UnsatisfiedLinkError) {
+            isAudioBackendLoaded = false
+            // 记下但不改变 isLibraryLoaded：仍可进入真实连接，只是没有远端声音。
+            lastLoadError = "音频后端库加载失败（远端声音将不可用）：${e.message}"
+            Log.w(TAG, "loadLibrary($LIB_AUDIO) 失败，已降级为无声模式", e)
+        } catch (e: Throwable) {
+            isAudioBackendLoaded = false
+            lastLoadError = "音频后端库加载失败（远端声音将不可用）：${e.javaClass.simpleName}: ${e.message}"
+            Log.w(TAG, "loadLibrary($LIB_AUDIO) 异常，已降级为无声模式", e)
+        }
+
+        return true
     }
 
     // ---------------- 连接管理 ----------------
@@ -111,18 +157,31 @@ object FreerdpJni {
     @JvmStatic
     fun onAudioData(data: ByteArray?, sampleRate: Int, channels: Int, bitsPerSample: Int) {
         if (data == null) return
-        AudioRedirect.write(data, sampleRate, channels, bitsPerSample)
+        // 防御：音频播放异常绝不能冒泡到原生调用栈（那里无法 catch），否则会直接崩 App。
+        try {
+            AudioRedirect.write(data, sampleRate, channels, bitsPerSample)
+        } catch (e: Throwable) {
+            Log.e(TAG, "onAudioData 播放失败", e)
+        }
     }
 
     /** 音频格式协商完成、即将开始播放（来自 FreeRDP 音频后端）。 */
     @JvmStatic
     fun onAudioStart() {
-        AudioRedirect.onStart()
+        try {
+            AudioRedirect.onStart()
+        } catch (e: Throwable) {
+            Log.e(TAG, "onAudioStart 失败", e)
+        }
     }
 
     /** 音频通道关闭（来自 FreeRDP 音频后端）。 */
     @JvmStatic
     fun onAudioStop() {
-        AudioRedirect.release()
+        try {
+            AudioRedirect.release()
+        } catch (e: Throwable) {
+            Log.e(TAG, "onAudioStop 失败", e)
+        }
     }
 }

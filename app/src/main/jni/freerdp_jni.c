@@ -60,9 +60,17 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
 	if (cls != NULL)
 	{
 		g_setEnabled = (*env)->GetStaticMethodID(env, cls, "setEnabled", "(Z)V");
+		if (g_setEnabled == NULL)
+		{
+			(*env)->ExceptionClear(env);
+			__android_log_print(ANDROID_LOG_WARN, TAG, "未找到 AudioRedirect.setEnabled(Z)V");
+		}
+		(*env)->DeleteLocalRef(env, cls);
 	}
 	else
 	{
+		/* FindClass 失败会留下挂起异常，必须清掉，否则后续 JNI 调用会莫名失败。 */
+		(*env)->ExceptionClear(env);
 		__android_log_print(ANDROID_LOG_ERROR, TAG, "无法找到 AudioRedirect 类");
 	}
 	return JNI_VERSION_1_6;
@@ -254,12 +262,16 @@ JNIEXPORT void JNICALL
 Java_com_accessrdp_client_jni_FreerdpJni_setAudioSinkEnabled(JNIEnv* env, jclass clazz, jboolean enabled)
 {
 	(void)clazz;
-	if (g_setEnabled != NULL)
+	if (g_setEnabled == NULL)
+		return;
+	jclass cls = (*env)->FindClass(env, "com/accessrdp/client/jni/AudioRedirect");
+	if (cls == NULL)
 	{
-		(*env)->CallStaticVoidMethod(env,
-			(*env)->FindClass(env, "com/accessrdp/client/jni/AudioRedirect"),
-			g_setEnabled, enabled);
+		(*env)->ExceptionClear(env);
+		return;
 	}
+	(*env)->CallStaticVoidMethod(env, cls, g_setEnabled, enabled);
+	(*env)->DeleteLocalRef(env, cls);
 }
 
 /* 告诉 FreeRDP 去 APK 的原生库目录里找 librdpsnd_android.so（音频后端）。

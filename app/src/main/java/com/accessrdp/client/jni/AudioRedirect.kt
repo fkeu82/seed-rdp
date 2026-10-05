@@ -46,6 +46,9 @@ object AudioRedirect {
      */
     fun write(data: ByteArray, sampleRate: Int, channels: Int, bitsPerSample: Int) {
         if (!audioEnabled || data.isEmpty()) return
+        // 某些异常采样率（0 / 负数 / 超范围）会让 AudioTrack 构造直接抛 IllegalArgumentException；
+        // 这里做一次防御性归一，避免原生回调线程上抛异常导致崩溃。
+        val rate = if (sampleRate in 8000..192000) sampleRate else 44100
         val ch = if (channels <= 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
         val encoding = if (bitsPerSample == 8) {
             AudioFormat.ENCODING_PCM_8BIT
@@ -53,24 +56,33 @@ object AudioRedirect {
             AudioFormat.ENCODING_PCM_16BIT
         }
         synchronized(lock) {
-            if (track == null || currentRate != sampleRate || currentChannels != ch || currentBits != encoding) {
-                track?.release()
-                val minBuf = AudioTrack.getMinBufferSize(sampleRate, ch, encoding)
-                    .coerceAtLeast(1)
-                track = AudioTrack(
-                    AudioManager.STREAM_MUSIC,
-                    sampleRate, ch, encoding,
-                    minBuf * 2, AudioTrack.MODE_STREAM
-                ).apply { play() }
-                currentRate = sampleRate
-                currentChannels = ch
-                currentBits = encoding
-                Log.i(TAG, "AudioTrack 已创建：${sampleRate}Hz / $channels 声道 / $bitsPerSample bit")
-            }
             try {
+                if (track == null || currentRate != rate || currentChannels != ch || currentBits != encoding) {
+                    track?.release()
+                    val minBuf = AudioTrack.getMinBufferSize(rate, ch, encoding)
+                        .coerceAtLeast(1)
+                    track = AudioTrack(
+                        AudioManager.STREAM_MUSIC,
+                        rate, ch, encoding,
+                        minBuf * 2, AudioTrack.MODE_STREAM
+                    ).apply { play() }
+                    currentRate = rate
+                    currentChannels = ch
+                    currentBits = encoding
+                    Log.i(TAG, "AudioTrack 已创建：${rate}Hz / $channels 声道 / $bitsPerSample bit")
+                }
                 track?.write(data, 0, data.size)
             } catch (e: Exception) {
+                // 任何播放异常都只记录，绝不冒泡（否则会导致 App 崩溃）。
                 Log.e(TAG, "AudioTrack.write 失败：${e.message}")
+                try {
+                    track?.release()
+                } catch (_: Exception) {
+                }
+                track = null
+                currentRate = 0
+                currentChannels = 0
+                currentBits = 0
             }
         }
     }

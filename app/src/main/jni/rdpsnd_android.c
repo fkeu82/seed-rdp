@@ -37,6 +37,7 @@ typedef struct
 
 /* ---- JNI 缓存（本 .so 由 FreeRDP dlopen 加载，需自带 JNI_OnLoad 缓存 JVM）---- */
 static JavaVM*   g_vm        = NULL;
+static jclass    g_jniClass  = NULL;   /* 全局引用，跨线程/跨调用稳定可用 */
 static jmethodID g_onAudioData = NULL; /* (byte[], rate, channels, bits) -> void */
 static jmethodID g_onAudioStart = NULL; /* () -> void */
 static jmethodID g_onAudioStop  = NULL; /* () -> void */
@@ -49,18 +50,53 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
 	if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK)
 		return JNI_ERR;
 
-	jclass cls = (*env)->FindClass(env, "com/accessrdp/client/jni/FreerdpJni");
-	if (cls != NULL)
+	jclass local = (*env)->FindClass(env, "com/accessrdp/client/jni/FreerdpJni");
+	if (local != NULL)
 	{
-		g_onAudioData = (*env)->GetStaticMethodID(env, cls, "onAudioData", "([BIII)V");
-		g_onAudioStart = (*env)->GetStaticMethodID(env, cls, "onAudioStart", "()V");
-		g_onAudioStop  = (*env)->GetStaticMethodID(env, cls, "onAudioStop", "()V");
+		/* 升级为全局引用：其它线程（FreeRDP 音频线程）也能安全使用，
+		 * 且避免每次回调都 FindClass（在非附着线程上 FindClass 会失败返回 NULL）。 */
+		g_jniClass = (jclass)(*env)->NewGlobalRef(env, local);
+		(*env)->DeleteLocalRef(env, local);
+
+		if (g_jniClass != NULL)
+		{
+			/* 逐个检查方法 ID：任一为 NULL 都只记日志，绝不带着 NULL 去调用
+			 * （JNI 规范中向 CallStaticVoidMethod 传 NULL jclass/jmethodID 属未定义行为，会直接崩溃）。 */
+			g_onAudioData  = (*env)->GetStaticMethodID(env, g_jniClass, "onAudioData", "([BIII)V");
+			g_onAudioStart = (*env)->GetStaticMethodID(env, g_jniClass, "onAudioStart", "()V");
+			g_onAudioStop  = (*env)->GetStaticMethodID(env, g_jniClass, "onAudioStop", "()V");
+
+			if (g_onAudioData == NULL || g_onAudioStart == NULL || g_onAudioStop == NULL)
+				__android_log_print(ANDROID_LOG_ERROR, TAG,
+				                    "FreerdpJni 回调方法未全部找到（data=%p start=%p stop=%p）",
+				                    (void*)g_onAudioData, (void*)g_onAudioStart, (void*)g_onAudioStop);
+		}
 	}
 	else
 	{
+		(*env)->ExceptionClear(env);
 		__android_log_print(ANDROID_LOG_ERROR, TAG, "无法找到 FreerdpJni 类");
 	}
 	return JNI_VERSION_1_6;
+}
+
+JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved)
+{
+	(void)vm;
+	(void)reserved;
+	/* 释放在 JNI_OnLoad 中创建的全局引用（若 .so 被卸载）。 */
+	if (g_vm != NULL)
+	{
+		JNIEnv* env = NULL;
+		if ((*g_vm)->GetEnv(g_vm, (void**)&env, JNI_VERSION_1_6) == JNI_OK && env != NULL)
+		{
+			if (g_jniClass != NULL)
+			{
+				(*env)->DeleteGlobalRef(env, g_jniClass);
+				g_jniClass = NULL;
+			}
+		}
+	}
 }
 
 /* 在 FreeRDP 音频线程上安全地拿到 JNIEnv（可能需 attach）。 */
@@ -79,9 +115,16 @@ static JNIEnv* get_env(int* need_detach)
 	return env;
 }
 
+/* 取 FreerdpJni 的 jclass：优先用 JNI_OnLoad 缓存的全局引用；
+ * 只有在缓存缺失时才退化为 FindClass（并清掉可能的挂起异常）。 */
 static jclass freerdp_jni_class(JNIEnv* env)
 {
-	return (*env)->FindClass(env, "com/accessrdp/client/jni/FreerdpJni");
+	if (g_jniClass != NULL)
+		return g_jniClass;
+	jclass cls = (*env)->FindClass(env, "com/accessrdp/client/jni/FreerdpJni");
+	if (cls == NULL)
+		(*env)->ExceptionClear(env);
+	return cls;
 }
 
 /* ---- 后端回调实现 ---- */
@@ -113,7 +156,11 @@ static BOOL android_open(rdpsndDevicePlugin* device, const AUDIO_FORMAT* format,
 	JNIEnv* env = get_env(&detach);
 	if (env != NULL && g_onAudioStart != NULL)
 	{
-		(*env)->CallStaticVoidMethod(env, freerdp_jni_class(env), g_onAudioStart);
+		jclass cls = freerdp_jni_class(env);
+		if (cls != NULL)
+			(*env)->CallStaticVoidMethod(env, cls, g_onAudioStart);
+		else
+			(*env)->ExceptionClear(env);
 	}
 	if (detach)
 		(*g_vm)->DetachCurrentThread(g_vm);
@@ -132,13 +179,25 @@ static UINT android_play(rdpsndDevicePlugin* device, const BYTE* data, size_t si
 	JNIEnv* env = get_env(&detach);
 	if (env != NULL && g_onAudioData != NULL)
 	{
-		jbyteArray arr = (*env)->NewByteArray(env, (jsize)size);
-		if (arr != NULL)
+		jclass cls = freerdp_jni_class(env);
+		if (cls != NULL)
 		{
-			(*env)->SetByteArrayRegion(env, arr, 0, (jsize)size, (const jbyte*)data);
-			(*env)->CallStaticVoidMethod(env, freerdp_jni_class(env), g_onAudioData,
-			                             arr, (jint)a->sampleRate, (jint)a->channels, (jint)a->bits);
-			(*env)->DeleteLocalRef(env, arr);
+			jbyteArray arr = (*env)->NewByteArray(env, (jsize)size);
+			if (arr != NULL)
+			{
+				(*env)->SetByteArrayRegion(env, arr, 0, (jsize)size, (const jbyte*)data);
+				(*env)->CallStaticVoidMethod(env, cls, g_onAudioData,
+				                             arr, (jint)a->sampleRate, (jint)a->channels, (jint)a->bits);
+				(*env)->DeleteLocalRef(env, arr);
+			}
+			else
+			{
+				(*env)->ExceptionClear(env);
+			}
+		}
+		else
+		{
+			(*env)->ExceptionClear(env);
 		}
 	}
 	if (detach)
@@ -162,7 +221,11 @@ static void android_close(rdpsndDevicePlugin* device)
 	JNIEnv* env = get_env(&detach);
 	if (env != NULL && g_onAudioStop != NULL)
 	{
-		(*env)->CallStaticVoidMethod(env, freerdp_jni_class(env), g_onAudioStop);
+		jclass cls = freerdp_jni_class(env);
+		if (cls != NULL)
+			(*env)->CallStaticVoidMethod(env, cls, g_onAudioStop);
+		else
+			(*env)->ExceptionClear(env);
 	}
 	if (detach)
 		(*g_vm)->DetachCurrentThread(g_vm);

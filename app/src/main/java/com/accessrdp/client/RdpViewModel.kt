@@ -66,15 +66,31 @@ class RdpViewModel : ViewModel() {
     val announcement: StateFlow<String?> = _announcement.asStateFlow()
 
     init {
-        // 启动即尝试加载原生库：成功则切换真实模式，失败则退回演示模式（不报错）。
-        val nativeLoaded = FreerdpJni.load()
+        // 启动即尝试加载原生库（load() 自带安全气囊，绝不抛异常）。
+        // 成功 → 真实连接模式；失败 → 退回演示模式（MockTransport）并播报原因，绝不闪退。
+        val nativeLoaded = try {
+            FreerdpJni.load()
+        } catch (t: Throwable) {
+            false
+        }
         _useRealNative.value = nativeLoaded
         _transport = if (nativeLoaded) NativeTransport() else MockTransport()
         manager.onSelectionChanged = { _selected.value = it.toSet() }
-        _announcement.value = if (nativeLoaded) {
-            "已加载 FreeRDP 原生库，连接后将进入真实远程桌面"
-        } else {
-            "未检测到原生库，当前为演示模式：可完整体验键盘与数据回显"
+
+        _announcement.value = when {
+            !nativeLoaded -> {
+                // 明确告知视障用户当前处于降级模式，以及可查看日志的位置。
+                val detail = FreerdpJni.lastLoadError
+                if (detail.isNullOrBlank()) {
+                    "音频库加载失败，已进入演示模式：可完整体验键盘与数据回显"
+                } else {
+                    "音频库加载失败，已进入演示模式。原因：$detail"
+                }
+            }
+            !FreerdpJni.isAudioBackendLoaded -> {
+                "已连接 FreeRDP 原生库，但音频后端未加载，远端声音可能不可用：${FreerdpJni.lastLoadError ?: ""}"
+            }
+            else -> "已加载 FreeRDP 原生库，连接后将进入真实远程桌面"
         }
     }
 
