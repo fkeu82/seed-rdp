@@ -130,7 +130,8 @@ jobs:
             # ---- FreeRDP（关闭所有内置音频/图形后端，仅保留 rdpsnd 通道；android 后端由我们提供）----
             echo "---- FreeRDP $ABI ----"
             rm -rf "$ROOT/freerdp-b-$ABI"; mkdir -p "$ROOT/freerdp-b-$ABI"
-            cmake -GNinja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            cmake -GNinja -S "$FREERDP_SRC" -B "$ROOT/freerdp-b-$ABI" \
+              -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
               -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API \
               -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release \
               -DBUILD_SHARED_LIBS=ON \
@@ -142,17 +143,17 @@ jobs:
               -DWITH_SSE2=OFF -DWITH_NEON=OFF \
               -DWITH_SERVER=OFF -DBUILD_TESTING=OFF -DWITH_SAMPLE=OFF \
               -DWITH_CLI=OFF -DWITH_MANPAGES=OFF -DWITH_PROXY=OFF \
-              -DWITH_CHANNELS=ON "$FREERDP_SRC"
+              -DWITH_CHANNELS=ON
             cmake --build "$ROOT/freerdp-b-$ABI" -j"$(nproc)"
             cmake --install "$ROOT/freerdp-b-$ABI"
 
             # ---- 我们的两个 JNI 库 ----
             echo "---- JNI bridge $ABI ----"
             rm -rf "$ROOT/bridge-b-$ABI"; mkdir -p "$ROOT/bridge-b-$ABI"
-            cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            cmake -S "$GITHUB_WORKSPACE/app/src/main/jni" -B "$ROOT/bridge-b-$ABI" \
+              -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
               -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API \
-              -DFREERDP_ROOT=$PREFIX -DCMAKE_INSTALL_PREFIX=$ROOT/bridge-out \
-              "$GITHUB_WORKSPACE/app/src/main/jni"
+              -DFREERDP_ROOT=$PREFIX -DCMAKE_INSTALL_PREFIX=$ROOT/bridge-out
             cmake --build "$ROOT/bridge-b-$ABI"
 
             # ---- 收集所有 .so ----
