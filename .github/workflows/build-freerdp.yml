@@ -1,0 +1,185 @@
+# =============================================================================
+# build-freerdp.yml
+# 在 GitHub Actions 云端机器上：
+#   1) 交叉编译 Android 版 FreeRDP（含我们打过补丁的 "android" 音频后端首选）
+#   2) 编译两个 JNI 原生库：libfreerdp_client.so（主桥接）+ librdpsnd_android.so（音频后端）
+#   3) 收集一整套 .so 到 app/src/main/jniLibs/<abi>/
+#   4) 打包可直接安装的 app-debug.apk（已集成真实 FreeRDP + 远端音频回传）
+#
+# 触发：
+#   - 推送到 main / master（自动开始编译并产出 APK 产物）
+#   - 打 v* 标签（额外把 APK 发布到 Release，附下载公网链接）
+#   - 手动：Actions 页面 “Run workflow”
+#
+# 国内加速：NDK 用腾讯镜像；FreeRDP / OpenSSL 用 ghproxy / Gitee 镜像回退。
+# =============================================================================
+name: Build FreeRDP & APK (Android)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: android-ndk-r25c
+      NDK_URL_TENCENT: https://mirrors.cloud.tencent.com/AndroidSDK/android-ndk-r25c-linux.zip
+      NDK_URL_GOOGLE: https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+      API: "24"
+      FREERDP_REF: "2.11.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装基础工具
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build make gcc python3
+
+      - name: 下载并安装 NDK（腾讯镜像优先，Google 回退）
+        run: |
+          set -e
+          if ! curl -fsSL --max-time 180 "$NDK_URL_TENCENT" -o ndk.zip; then
+            curl -fsSL --max-time 180 "$NDK_URL_GOOGLE" -o ndk.zip
+          fi
+          unzip -q ndk.zip
+          echo "NDK=$PWD/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN=$PWD/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$PWD/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      # 带镜像回退的 git clone
+      - name: 克隆 FreeRDP 与 OpenSSL 源码
+        run: |
+          set -e
+          clone() {
+            local repo="$1" out="$2" ref="$3"
+            for base in "https://github.com" "https://ghproxy.com/https://github.com" "https://gitee.com/mirrors"; do
+              if [ "$base" = "https://gitee.com/mirrors" ]; then
+                # Gitee 镜像路径不同
+                url="https://gitee.com/mirrors/${repo#FreeRDP/}.git"
+                [ "$repo" = "openssl/openssl" ] && url="https://gitee.com/mirrors/openssl.git"
+              else
+                url="$base/$repo.git"
+              fi
+              echo "try $url @ $ref"
+              if git clone --depth 1 -b "$ref" "$url" "$out" 2>/dev/null; then
+                echo "OK $out"; return 0
+              fi
+            done
+            return 1
+          }
+          clone FreeRDP/FreeRDP FreeRDP "$FREERDP_REF"
+          clone openssl/openssl openssl-src "openssl-3.1.4"
+
+      # 关键补丁：把我们的 "android" 音频后端设为首选（FreeRDP 会优先 dlopen librdpsnd_android.so）
+      - name: 补丁 rdpsnd 后端选择（置 android 为首选）
+        run: |
+          set -e
+          python3 - <<'PY'
+          import re
+          p = "FreeRDP/channels/rdpsnd/client/rdpsnd_main.c"
+          s = open(p, encoding="utf-8").read()
+          # 在 backends[] 数组里，于 { "fake", "" } 之前插入 { "android", "" }，
+          # 使 FreeRDP 优先加载我们的 librdpsnd_android.so 音频后端。
+          new, n = re.subn(r'(\n[ \t]*\{ "fake", "" \})',
+                           r'\n\t\t{ "android", "" },\1', s, count=1)
+          open(p, "w", encoding="utf-8").write(new)
+          print("patched android backend, replacements =", n)
+          PY
+
+      - name: 交叉编译 OpenSSL / FreeRDP / 两个 JNI 库（arm64-v8a + armeabi-v7a）
+        run: |
+          set -e
+          ROOT=$PWD/build
+          mkdir -p "$ROOT" && cd "$ROOT"
+          PREFIX=$ROOT/freerdp-install
+          SSL_PREFIX=$ROOT/openssl
+          export PATH=$TOOLCHAIN/bin:$PATH
+          export ANDROID_NDK_ROOT=$NDK
+
+          for ABI in arm64-v8a armeabi-v7a; do
+            echo "================ ABI=$ABI ================"
+            if [ "$ABI" = "arm64-v8a" ]; then
+              TARGET=android-arm64; CROSS=aarch64-linux-android-; ANDROID_ABI=arm64-v8a
+            else
+              TARGET=android-arm;    CROSS=armv7a-linux-androideabi-; ANDROID_ABI=armeabi-v7a
+            fi
+
+            # ---- OpenSSL ----
+            ( cd openssl-src && ./Configure $TARGET -D__ANDROID_API__=$API --prefix=$SSL_PREFIX \
+                --cross-compile-prefix=$TOOLCHAIN/bin/$CROSS- && make -j"$(nproc)" && make install_sw )
+
+            # ---- FreeRDP（关闭所有内置音频/图形后端，仅保留 rdpsnd 通道；android 后端由我们提供）----
+            rm -rf freerdp-b-$ABI && mkdir freerdp-b-$ABI && cd freerdp-b-$ABI
+            cmake -GNinja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=$ANDROID_ABI -DANDROID_PLATFORM=android-$API \
+              -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON \
+              -DWITH_OPENSSL=ON -DOPENSSL_ROOT_DIR=$SSL_PREFIX \
+              -DWITH_OPENH264=OFF -DWITH_FFMPEG=OFF -DWITH_JPEG=OFF \
+              -DWITH_PULSE=OFF -DWITH_ALSA=OFF -DWITH_OSS=OFF -DWITH_OPENSLES=OFF \
+              -DWITH_WINMM=OFF -DWITH_MACAUDIO=OFF -DWITH_IOSAUDIO=OFF \
+              -DWITH_CUPS=OFF -DWITH_WAYLAND=OFF -DWITH_URBDRC=OFF -DWITH_GSSAPI=OFF \
+              -DWITH_SSE2=OFF -DWITH_NEON=ON \
+              -DWITH_SERVER=OFF -DBUILD_TESTING=OFF -DWITH_SAMPLE=OFF \
+              -DWITH_CLI=OFF -DWITH_MANPAGES=OFF -DWITH_PROXY=OFF \
+              -DWITH_CHANNELS=ON ..
+            cmake --build . -j"$(nproc)"
+            cmake --install .
+            cd ..
+
+            # ---- 我们的两个 JNI 库 ----
+            rm -rf bridge-b-$ABI && mkdir bridge-b-$ABI && cd bridge-b-$ABI
+            cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=$ANDROID_ABI -DANDROID_PLATFORM=android-$API \
+              -DFREERDP_ROOT=$PREFIX -DCMAKE_INSTALL_PREFIX=$ROOT/bridge-out .
+            cmake --build .
+            cd ..
+
+            # ---- 收集所有 .so ----
+            DST=$GITHUB_WORKSPACE/app/src/main/jniLibs/$ANDROID_ABI
+            mkdir -p "$DST"
+            cp -v bridge-b-$ABI/libfreerdp_client.so "$DST/"
+            cp -v bridge-b-$ABI/librdpsnd_android.so "$DST/"
+            cp -v $PREFIX/lib/*.so "$DST/" 2>/dev/null || true
+            echo "---- collected $ANDROID_ABI ----"
+            ls -la "$DST"
+          done
+
+      # ---- 打包 APK（含真实 FreeRDP + 音频后端）----
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Android SDK 并编译 debug APK（可直接安装体验）
+        run: |
+          set -e
+          yes | sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          export ANDROID_HOME=$ANDROID_HOME
+          export JAVA_HOME=$JAVA_HOME
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk app-debug.apk
+
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: AccessRDP-debug-apk
+          path: app-debug.apk
+          if-no-files-found: error
+
+      - name: 发布 Release（打 v* 标签时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app-debug.apk
+          body: |
+            AccessRDP 真实连接版（已集成 FreeRDP 原生库 + 远端音频重定向）。
+            安装后点“连接”即为真实远程桌面；NVDA 等读屏语音会通过 RDP 音频重定向传回手机播放。

@@ -1,0 +1,73 @@
+name: Build Android APK
+
+# 触发条件：推送到 main 分支、打 v* 标签、或手动触发
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # 安装 Android SDK 命令行工具，并设置 ANDROID_HOME
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 接受许可证并安装编译所需 SDK 包
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+      # 依赖仓库与插件仓库已在 settings.gradle.kts 指向阿里云镜像（国内加速）。
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: 赋予 gradlew 可执行权限
+        run: chmod +x gradlew
+
+      - name: 构建 Debug APK（可直接安装体验）
+        run: ./gradlew assembleDebug --no-daemon
+
+      # 如需正式发布签名包：在仓库 Secrets 配置 KEYSTORE_BASE64 / KEY_ALIAS /
+      # KEYSTORE_PASSWORD / KEY_PASSWORD，并把下面一行改为 assembleRelease。
+      - name: 构建 Release APK（如有签名配置）
+        run: ./gradlew assembleRelease --no-daemon || echo "未配置签名，跳过 Release 构建"
+
+      - name: 上传 APK 构件（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: AccessRDP-APK
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+          if-no-files-found: ignore
+
+      # 打标签（如 v1.0.0）时，自动把 APK 发布到 GitHub Release 供下载。
+      - name: 发布到 GitHub Release（仅打标签时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

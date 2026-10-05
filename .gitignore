@@ -1,0 +1,14 @@
+# 编译产物
+.gradle/
+build/
+app/build/
+captures/
+local.properties
+
+# IDE
+*.iml
+.idea/
+.DS_Store
+
+# 原生库（接入真实 FreeRDP 后，把 libfreerdp_client.so 放到 app/src/main/jniLibs/<abi>/）
+app/src/main/jniLibs/

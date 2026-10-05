@@ -1,0 +1,7 @@
+<resources>
+    <!-- Compose 使用 MaterialTheme，这里仅提供窗口级别的 NoActionBar 主题，
+         避免系统 ActionBar 与 Compose 内容重叠，并保证启动背景。 -->
+    <style name="Theme.AccessRDP" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>
