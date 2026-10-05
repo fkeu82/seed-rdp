@@ -34,15 +34,33 @@ include_directories(
   ${FREERDP_ROOT}/include/winpr
 )
 
-# 定位依赖库（全部来自 FREERDP_ROOT/lib，禁用系统默认路径）
-find_library(FREERDP_LIB      NAMES freerdp2       PATHS ${FREERDP_ROOT}/lib NO_DEFAULT_PATH REQUIRED)
-find_library(FREERDP_CLI_LIB  NAMES freerdp-client2 PATHS ${FREERDP_ROOT}/lib NO_DEFAULT_PATH REQUIRED)
-find_library(WINPR_LIB        NAMES winpr2         PATHS ${FREERDP_ROOT}/lib NO_DEFAULT_PATH REQUIRED)
-find_library(SSL_LIB          NAMES ssl            PATHS ${FREERDP_ROOT}/lib NO_DEFAULT_PATH)
-find_library(CRYPTO_LIB       NAMES crypto         PATHS ${FREERDP_ROOT}/lib NO_DEFAULT_PATH)
+# 定位依赖库。
+# 注意：交叉编译时 NDK 工具链会把 CMAKE_FIND_ROOT_PATH_MODE_LIBRARY 设为 ONLY，
+# 导致 find_library 只搜 NDK sysroot、完全忽略我们给的 PATHS，从而找不到
+# build/freerdp-install/lib 下的 .so。因此这里直接构造绝对路径，可靠且不受
+# find-root-path 影响；同时显式校验文件存在，缺失即报错而不是悄悄把空串当库名。
+set(_fr_libdir ${FREERDP_ROOT}/lib)
+set(FREERDP_LIB      ${_fr_libdir}/libfreerdp2.so)
+set(FREERDP_CLI_LIB  ${_fr_libdir}/libfreerdp-client2.so)
+set(WINPR_LIB        ${_fr_libdir}/libwinpr2.so)
+foreach(_l FREERDP_LIB FREERDP_CLI_LIB WINPR_LIB)
+  if(NOT EXISTS ${${_l}})
+    message(FATAL_ERROR "找不到依赖库 ${_l}: ${${_l}} （请确认 FreeRDP 已正确安装到 ${FREERDP_ROOT}）")
+  endif()
+  message(STATUS "${_l} = ${${_l}}")
+endforeach()
 
-# ssl/crypto 来自按 ABI 单独编译的 OpenSSL，不一定在 FREERDP_ROOT/lib 中；
-# 找不到时留空会导致 target_link_libraries 把空串当库名而报错，故按需追加。
+# ssl/crypto 来自按 ABI 单独编译的 OpenSSL（通过 -DOPENSSL_ROOT=... 传入），
+# 不一定在 FREERDP_ROOT/lib 中。找到则显式链接（写入 DT_NEEDED，运行时由动态
+# 链接器加载）；找不到也无害——libfreerdp2.so 自身已带 DT_NEEDED libssl/libcrypto。
+set(SSL_LIB "")
+set(CRYPTO_LIB "")
+if(DEFINED OPENSSL_ROOT AND EXISTS "${OPENSSL_ROOT}/lib/libssl.so")
+  set(SSL_LIB   ${OPENSSL_ROOT}/lib/libssl.so)
+  set(CRYPTO_LIB ${OPENSSL_ROOT}/lib/libcrypto.so)
+  message(STATUS "OpenSSL = ${SSL_LIB}")
+endif()
+
 set(COMMON_LIBS
   ${FREERDP_CLI_LIB}
   ${FREERDP_LIB}

@@ -153,7 +153,7 @@ jobs:
             cmake -S "$GITHUB_WORKSPACE/app/src/main/jni" -B "$ROOT/bridge-b-$ABI" \
               -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
               -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API \
-              -DFREERDP_ROOT=$PREFIX -DCMAKE_INSTALL_PREFIX=$ROOT/bridge-out
+              -DFREERDP_ROOT=$PREFIX -DOPENSSL_ROOT=$SSL_PREFIX -DCMAKE_INSTALL_PREFIX=$ROOT/bridge-out
             cmake --build "$ROOT/bridge-b-$ABI"
 
             # ---- 收集所有 .so ----
