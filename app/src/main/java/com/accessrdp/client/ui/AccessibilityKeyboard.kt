@@ -1,5 +1,7 @@
 package com.accessrdp.client.ui
 
+import com.accessrdp.client.BuildConfig
+
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -105,6 +107,22 @@ private fun ConnectionForm(viewModel: RdpViewModel, connection: ConnectionState)
     var pass by remember { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxWidth()) {
+
+        // ---- 版本号（读屏可见，用来核对"装的到底是哪一版"）----
+        // 背景：此前 Release 写着 v1.0.4，装出来却显示 1.0.3，
+        // 有了这行，用户开屏即可确认实际运行版本，便于排查「版本号漂移」。
+        Text(
+            text = "版本 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics {
+                    contentDescription =
+                        "当前应用版本 ${BuildConfig.VERSION_NAME}，版本代码 ${BuildConfig.VERSION_CODE}"
+                }
+        )
+        Spacer(Modifier.height(8.dp))
 
         // ---- 第一行：主机 + 端口（并排，端口默认 3389）----
         Row(

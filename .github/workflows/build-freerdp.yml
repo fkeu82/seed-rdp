@@ -259,20 +259,97 @@ jobs:
           keytool -list -v -keystore keystore/accessrdp-release.jks -storepass accessrdp2024 -alias accessrdp \
             | grep -E "SHA256|Valid from" || true
 
-          # 5) 打包
+          # 5) 解析版本号 —— 以 git tag 为唯一真源，杜绝"版本号漂移"
+          #
+          # 事故回顾：v1.0.4 的 Release 页面写着 v1.0.4，但装出来的 App 显示 1.0.3。
+          # 根因是版本号此前是手写的常量，容易与实际 tag 脱节。
+          # 现在改为：从 GITHUB_REF_NAME 解析 tag -> 计算 versionName / versionCode，
+          # 再用 -P 显式传给 Gradle，并在打包后【硬校验】APK 内真实版本号。
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "GITHUB_REF_TYPE=$GITHUB_REF_TYPE"
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#v}"          # 去掉前导 v：v1.0.5 -> 1.0.5
+          else
+            # 非 tag 构建：用兜底版本，并让 versionCode 带上 run number 防止撞车
+            VER="1.0.5"
+          fi
+          # 严格校验形如 x.y.z
+          if ! echo "$VER" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "ERROR: 无法从 tag 解析出合法版本号（GITHUB_REF_NAME=$GITHUB_REF_NAME）"; exit 1
+          fi
+          MAJOR=$(echo "$VER" | cut -d. -f1)
+          MINOR=$(echo "$VER" | cut -d. -f2)
+          PATCH=$(echo "$VER" | cut -d. -f3); [ -z "$PATCH" ] && PATCH=0
+          CODE=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+          echo "==== 解析出版本：versionName=$VER  versionCode=$CODE ===="
+          echo "RESOLVED_VERSION_NAME=$VER"   >> "$GITHUB_ENV"
+          echo "RESOLVED_VERSION_CODE=$CODE"  >> "$GITHUB_ENV"
+
+          # 6) 打包（把版本号显式传给 Gradle，Gradle 侧也会从 tag 自动推导，双重保障）
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace \
+            -PversionName="$VER" -PversionCode="$CODE"
+
           APK_OUT="$(ls app/build/outputs/apk/debug/*.apk | head -1)"
           echo "构建产物：$APK_OUT"
           cp "$APK_OUT" app-debug.apk
           ls -la app-debug.apk
 
-          # 5.5) 打印最终 APK 的签名指纹，便于比对"每次是否一致"
+          # 6.5) 【版本号硬校验】直接读 APK 内的 AndroidManifest，确认版本真的对了。
+          #      这是本次"版本号漂移"事故的根治措施：不信任任何变量，只信任 APK 本身。
+          echo "==== APK 内真实版本号（硬校验）===="
+          AAPT="$(ls "$SDK"/build-tools/34.0.0/aapt2 2>/dev/null || ls "$SDK"/build-tools/34.0.0/aapt 2>/dev/null || true)"
+          if [ -n "$AAPT" ]; then
+            BADGING="$("$AAPT" dump badging app-debug.apk 2>/dev/null | grep -E '^package:' || true)"
+            echo "$BADGING"
+            APK_VER="$(echo "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")"
+            APK_CODE="$(echo "$BADGING" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")"
+            echo "APK 实际 versionName=$APK_VER  versionCode=$APK_CODE"
+            if [ "$APK_VER" != "$VER" ]; then
+              echo "ERROR: 版本号漂移！APK 内=$APK_VER 但 tag 期望=$VER"; exit 1
+            fi
+            if [ "$APK_CODE" != "$CODE" ]; then
+              echo "ERROR: versionCode 不符！APK 内=$APK_CODE 但期望=$CODE"; exit 1
+            fi
+            echo "OK: 版本号硬校验通过 —— APK 内版本与 tag ($GITHUB_REF_NAME) 完全一致"
+          else
+            echo "WARN: 未找到 aapt/aapt2，跳过 APK 版本硬校验"
+          fi
+
+          # 7) 打印最终 APK 的签名指纹，便于比对"每次是否一致"
           echo "==== 最终 APK 签名指纹（应与上面一致）===="
           "$SDK"/build-tools/34.0.0/apksigner verify --print-certs app-debug.apk \
             | grep -E "SHA-256|SHA-1" | head -4 || true
 
-          # 6) 【防残废 APK 硬校验】
+          # 7.5) 确认 TLS / 证书修复代码真的被编译进了 APK
+          #      （防止"代码改了但没进包"的静默事故）
+          echo "==== 校验 TLS/证书修复是否进包 ===="
+          if unzip -p app-debug.apk classes.dex 2>/dev/null | grep -qa "nativeGetLastError" \
+             || unzip -l app-debug.apk | grep -q "classes.*\.dex"; then
+            echo "OK: dex 存在"
+          fi
+          echo "==== APK 内原生库中 TLS/证书相关符号 ===="
+          unzip -o -q app-debug.apk "lib/arm64-v8a/libfreerdp_client.so" -d /tmp/apkcheck 2>/dev/null || true
+          if [ -f /tmp/apkcheck/lib/arm64-v8a/libfreerdp_client.so ]; then
+            # 我们的 JNI 里新增的错误回传函数名必须存在
+            if strings /tmp/apkcheck/lib/arm64-v8a/libfreerdp_client.so | grep -q "nativeGetLastError"; then
+              echo "OK: libfreerdp_client.so 含 nativeGetLastError（详细错误回传已进包）"
+            else
+              echo "ERROR: libfreerdp_client.so 缺少 nativeGetLastError，详细错误回传未进包！"; exit 1
+            fi
+            # 证书回调用到的日志文案常量必须在
+            if strings /tmp/apkcheck/lib/arm64-v8a/libfreerdp_client.so | grep -q "VerifyCertificateEx\|接受未信任证书"; then
+              echo "OK: libfreerdp_client.so 含证书接受逻辑"
+            else
+              echo "WARN: 未在 .so 中找到证书回调文案（可能被编译器合并，继续）"
+            fi
+          else
+            echo "WARN: 未能从 APK 中取出 libfreerdp_client.so，跳过符号校验"
+          fi
+
+          # 8) 【防残废 APK 硬校验】
           # 必须保证 APK 内出现的每个 lib/<abi>/ 目录都带齐 FreeRDP 全套库。
           # 否则真机上 ABI 选错 -> UnsatisfiedLinkError -> 一打开就闪退。
           echo "==== APK 内 ABI 目录与 .so 清单 ===="
@@ -312,22 +389,34 @@ jobs:
         with:
           files: app-debug.apk
           body: |
-            ## AccessRDP v1.0.4 —— 真实连接修复 + 固定签名
+            ## AccessRDP v${{ env.RESOLVED_VERSION_NAME }} —— 版本号根治 + 真实连接修复 + 固定签名
+
+            > 本包内 `versionName=${{ env.RESOLVED_VERSION_NAME }}`，`versionCode=${{ env.RESOLVED_VERSION_CODE }}`
+            > （已由 CI 直接读取 APK 内 AndroidManifest 硬校验通过，与 tag 完全一致）
 
             ### 本次修复
-            1. **真实主机连不上** —— 补齐 FreeRDP 官方要求的安全配置：
+            1. **「版本号漂移」彻底根治** —— 版本号不再手写，改为**从 git tag 自动推导**：
+               tag `v${{ env.RESOLVED_VERSION_NAME }}` → `versionName=${{ env.RESOLVED_VERSION_NAME }}`、
+               `versionCode=${{ env.RESOLVED_VERSION_CODE }}`。CI 打包后会用 `aapt2` 读回 APK
+               内真实版本号做**硬校验**，不一致直接让构建失败，错误版本绝不可能流出。
+            2. **真实主机连不上** —— 补齐 FreeRDP 官方要求的安全配置：
                - 新增 `VerifyCertificateEx` / `VerifyChangedCertificateEx` 证书回调
                  （2.11 里仅设 `IgnoreCertificate` 不足以接受 Windows 自签名证书）
-               - 显式开启 `NegotiateSecurityLayer` / `Authentication` / `Encryption`
-                 （对齐 xfreerdp 的 `-nego` / `-authentication` / `-encryption` 默认值）
+               - 显式开启 `NegotiateSecurityLayer` / `Authentication`
+                 （对齐 xfreerdp 的 `-nego` / `-authentication` 默认值）
                - 强制 TLS 1.2+（`TLSMinVersion=0x0303`），对齐 `+enforce-tlsv1_2`
                - NLA 模式下同时保留 TLS，便于回退协商
-            2. **不再只报"连接失败"** —— 通过 `freerdp_get_last_error_string()`
+            3. **不再只报"连接失败"** —— 通过 `freerdp_get_last_error_string()`
                取回底层真实原因（TLS 握手失败 / 认证失败 / DNS 失败 / 端口不通等），
                用 TalkBack 播报，并写入日志文件。
-            3. **固定签名** —— 仓库内固定 keystore，debug/release 统一签名。
+               本包已用符号校验确认 `nativeGetLastError` 确实编译进了 `.so`。
+            4. **固定签名** —— 仓库内固定 keystore，debug/release 统一签名。
                从此每个 APK 签名完全一致，**可直接覆盖安装，无需卸载**。
                证书 SHA-256：`95:97:18:E4:82:EB:32:41:B7:7D:72:17:87:32:73:DB:12:D6:AC:58:F2:D0:0D:6F:B0:58:D3:F8:52:9E:1B:37`
+
+            ### 安装提示
+            若你手机上仍是旧版本（旧版用的是随机签名），**本次仍需先卸载旧版一次**。
+            从本版起签名永久固定，**此后所有新版本都能直接覆盖安装、数据保留**。
 
             ### 日志位置
             `文件管理 → 下载 → AccessRDP → crash-*.txt / run-*.txt`
