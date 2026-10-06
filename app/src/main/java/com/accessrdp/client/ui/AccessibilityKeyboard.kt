@@ -41,7 +41,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.stateDescription
@@ -70,11 +70,10 @@ import com.accessrdp.client.transport.ConnectionConfig
  */
 @Composable
 fun AccessRdpScreen(viewModel: RdpViewModel = viewModel()) {
-    val selected by viewModel.selected.collectAsState()
     val connection by viewModel.connection.collectAsState()
     val announcement by viewModel.announcement.collectAsState()
 
-    // 让 TalkBack 朗读最新状态/结果（含“连接失败，请检查主机和端口”）
+    // 让 TalkBack 朗读最新状态/结果（连接成功 / 连接失败的真实原因）
     Announcer(announcement)
 
     Column(
@@ -86,8 +85,9 @@ fun AccessRdpScreen(viewModel: RdpViewModel = viewModel()) {
         // 1) 连接表单：始终显示，是唯一的主界面
         ConnectionForm(viewModel, connection)
 
-        // 2) 键盘区：仅在连接成功后出现。
-        //    未连接时不渲染任何键盘/提示，避免读屏焦点被无意义控件占据。
+        // 2) 键盘区：**仅在真实连接成功后**出现。
+        //    这是从 UI 结构上杜绝"假连接却弹键盘"——只要 connection 不是 CONNECTED，
+        //    键盘组件根本不会进入组合树，不存在任何"假弹键盘"的可能。
         if (connection == ConnectionState.CONNECTED) {
             Spacer(Modifier.height(16.dp))
             KeyboardArea(viewModel)
@@ -105,6 +105,8 @@ private fun ConnectionForm(viewModel: RdpViewModel, connection: ConnectionState)
     var port by remember { mutableStateOf("3389") }
     var user by remember { mutableStateOf("") }
     var pass by remember { mutableStateOf("") }
+
+    val lastFailure by viewModel.lastFailure.collectAsState()
 
     Column(modifier = Modifier.fillMaxWidth()) {
 
@@ -185,6 +187,29 @@ private fun ConnectionForm(viewModel: RdpViewModel, connection: ConnectionState)
         )
         Spacer(Modifier.height(12.dp))
 
+        // ---- 【连接失败原因常驻展示区】----
+        // 只在失败后显示，且**原样呈现底层真实原因**（如「端口拒绝连接」「连接超时」
+        // 「认证失败」），读屏可反复聚焦回看。这是"如实告知用户"的落点。
+        lastFailure?.takeIf { it.isNotBlank() }?.let { reason ->
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.errorContainer)
+                    .semantics {
+                        contentDescription = "连接失败原因：$reason"
+                    }
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = "连接失败：$reason",
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+
         // ---- 按钮区：未连接=连接；连接中=连接中…；已连接=断开 ----
         when (connection) {
             ConnectionState.DISCONNECTED -> {
@@ -261,17 +286,22 @@ private fun KeyboardArea(viewModel: RdpViewModel) {
         Spacer(Modifier.height(8.dp))
 
         // ---- 修饰键复选框 ----
+        SectionLabel("修饰键")
         ModifierToggleRow(
             requester = rModifier, upTarget = rModifier, downTarget = rPreset,
             selected = selected, onToggle = viewModel::toggleModifier
         )
         Spacer(Modifier.height(6.dp))
-        OutlinedButton(onClick = { viewModel.clearModifiers() }) {
+        OutlinedButton(
+            onClick = { viewModel.clearModifiers() },
+            modifier = Modifier.semantics { contentDescription = "清除已选修饰键" }
+        ) {
             Text("清除修饰键")
         }
         Spacer(Modifier.height(12.dp))
 
         // ---- 快捷组合 ----
+        SectionLabel("快捷组合键")
         PresetRow(
             requester = rPreset, upTarget = rModifier, downTarget = rLetter[0],
             viewModel = viewModel
@@ -279,6 +309,7 @@ private fun KeyboardArea(viewModel: RdpViewModel) {
         Spacer(Modifier.height(12.dp))
 
         // ---- 字母键 ----
+        SectionLabel("字母键")
         KeyTables.QWERTY_ROWS.forEachIndexed { i, row ->
             KeyRow(
                 keys = row, onFire = viewModel::fire, requester = rLetter[i],
@@ -289,6 +320,7 @@ private fun KeyboardArea(viewModel: RdpViewModel) {
         }
 
         // ---- 数字键 ----
+        SectionLabel("数字键")
         KeyRow(
             keys = KeyTables.DIGIT_KEYS, onFire = viewModel::fire, requester = rDigit,
             upTarget = rLetter[lastLetter], downTarget = rFkey
@@ -296,6 +328,7 @@ private fun KeyboardArea(viewModel: RdpViewModel) {
         Spacer(Modifier.height(6.dp))
 
         // ---- 功能键 ----
+        SectionLabel("功能键")
         KeyRow(
             keys = KeyTables.FUNCTION_KEYS, onFire = viewModel::fire, requester = rFkey,
             upTarget = rDigit, downTarget = rControl
@@ -303,11 +336,26 @@ private fun KeyboardArea(viewModel: RdpViewModel) {
         Spacer(Modifier.height(6.dp))
 
         // ---- 控制键 ----
+        SectionLabel("控制键")
         KeyRow(
             keys = KeyTables.CONTROL_KEYS, onFire = viewModel::fire, requester = rControl,
             upTarget = rFkey, downTarget = rControl
         )
     }
+}
+
+/** 分区小标题：标记为 heading，方便读屏按标题快速跳转。 */
+@Composable
+private fun SectionLabel(text: String) {
+    Spacer(Modifier.height(4.dp))
+    Text(
+        text = text,
+        fontSize = 13.sp,
+        fontWeight = FontWeight.Medium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.semantics { heading() }
+    )
+    Spacer(Modifier.height(4.dp))
 }
 
 // ----------------------------------------------------------------------------
@@ -359,11 +407,10 @@ private fun StickyModifierToggle(
             .clip(RoundedCornerShape(10.dp))
             .background(containerColor)
             .combinedClickable(
-                role = Role.Checkbox,
                 onClick = onToggle,
                 onLongClick = onToggle
             )
-            .semantics {
+            .clearAndSetSemantics {
                 contentDescription = modifier.spokenName
                 stateDescription = if (checked) "已选中" else "未选中"
             }
@@ -414,7 +461,9 @@ private fun PresetRow(
                     .clip(RoundedCornerShape(8.dp))
                     .background(MaterialTheme.colorScheme.surfaceVariant)
                     .clickable { viewModel.firePreset(mods, base) }
-                    .semantics { contentDescription = "快捷组合：$label" }
+                    .clearAndSetSemantics {
+                        contentDescription = "快捷组合 $label"
+                    }
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 contentAlignment = Alignment.Center
             ) {
@@ -450,27 +499,59 @@ private fun KeyRow(
 }
 
 /**
- * 单个基础键按钮：用基础 Box + 基金会 clickable，读屏只朗读 contentDescription（如“字母 D”），
- * 不附加“按钮”角色后缀，同时保留双击激活能力。
+ * 单个基础键按钮 —— 无障碍核心修复点。
+ *
+ * 【为什么不用 Button / 不用 Role.Button】
+ * Material 的 Button 自带 `Role.Button` 语义，TalkBack 会在朗读内容后自动追加
+ * “按钮”二字，于是字母 D 被读成“D，按钮”。对视障用户来说，
+ * 每个键后面都挂个“按钮”是纯噪音，**只应读出字母本身**。
+ *
+ * 【方案】Box + clickable + clearAndSetSemantics
+ *   - `clickable`：保留点击与 TalkBack“双击激活”能力；
+ *     刻意**不指定 role**，避免任何“按钮”后缀。
+ *   - `clearAndSetSemantics`：**先清空**子节点自动汇聚上来的所有语义
+ *     （Text 文本、"按钮"角色等），**再只设置**我们给出的 contentDescription，
+ *     确保朗读内容唯一且可控。
+ *   - 每个键都带有明确、唯一的 contentDescription（逐个补全，无一遗漏）。
  */
 @Composable
 private fun KeyButton(key: RdpKey, onKey: (RdpKey) -> Unit, focusModifier: Modifier = Modifier) {
-    val spoken = when {
-        key.label.length == 1 && key.label[0].isLetter() -> "字母 ${key.label}"
-        key.label.all { it.isDigit() } -> "数字 ${key.label}"
-        key.label.startsWith("F") && key.label.drop(1).all { it.isDigit() } -> "功能键 ${key.label}"
-        else -> "按键 ${key.label}"
-    }
+    val spoken = spokenDescription(key)
     Box(
         modifier = focusModifier
             .clip(RoundedCornerShape(8.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .clickable { onKey(key) }
-            .semantics { contentDescription = spoken }
+            .clearAndSetSemantics { contentDescription = spoken }
             .padding(horizontal = 12.dp, vertical = 10.dp),
         contentAlignment = Alignment.Center
     ) {
         Text(key.label, fontSize = 15.sp)
+    }
+}
+
+/**
+ * 为每个键生成读屏文本。
+ *
+ * 规则（确保“读不出的字母”不存在）：
+ *   - 单字母         -> “字母 A”
+ *   - 全数字         -> “数字 5”
+ *   - F1~F12         -> “功能键 F1”
+ *   - 多字符控制键   -> “按键 Esc”/“按键 Tab”/“按键 Ctrl”…
+ *   - 兜底           -> “按键 <标签>”（保证任何键都有非空描述）
+ *
+ * 注意：不返回空串。若未来新增键位忘了加规则，兜底分支也能保证有语音输出，
+ * 不会出现“读不出的键”。
+ */
+private fun spokenDescription(key: RdpKey): String {
+    val label = key.label
+    return when {
+        label.isEmpty() -> "未知按键"
+        label.length == 1 && label[0].isLetter() -> "字母 $label"
+        label.all { it.isDigit() } -> "数字 $label"
+        label.length >= 2 && label[0].uppercaseChar() == 'F' && label.drop(1).all { it.isDigit() } ->
+            "功能键 $label"
+        else -> "按键 $label"
     }
 }
 

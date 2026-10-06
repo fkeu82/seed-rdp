@@ -28,10 +28,19 @@ class NativeTransport : RdpTransport {
         get() = connected && FreerdpJni.isLibraryLoaded
 
     override fun connect(config: ConnectionConfig): ConnectionResult {
+        // 【铁律】进入本方法第一件事：把上一次的连接状态彻底清掉。
+        // 避免"上次连上了、这次连不上，但 connected 标志还残留 true"的脏状态。
+        connected = false
+
         // 1) 加载原生库（load 自带安全气囊，理论上不抛，但仍包一层）
+        //    加载失败 = 无法进行真实连接。这里**如实报错**，绝不降级为假连接。
         try {
             if (!FreerdpJni.isLibraryLoaded && !FreerdpJni.load()) {
-                return ConnectionResult.Failure("未找到 FreeRDP 原生库 (libfreerdp_client.so)")
+                val detail = FreerdpJni.lastLoadError
+                return ConnectionResult.Failure(
+                    "未找到 FreeRDP 原生库 (libfreerdp_client.so)"
+                            + if (detail.isNullOrBlank()) "" else "：$detail"
+                )
             }
         } catch (t: Throwable) {
             Log.e(TAG, "加载原生库失败", t)
@@ -42,14 +51,24 @@ class NativeTransport : RdpTransport {
         if (config.host.isBlank()) {
             return ConnectionResult.Failure("主机地址为空")
         }
-        val port = if (config.port in 1..65535) config.port else 3389
+        if (config.port !in 1..65535) {
+            return ConnectionResult.Failure(
+                "端口 ${config.port} 非法（合法范围 1-65535）。"
+            )
+        }
+        val port = config.port
 
-        // 3) 真正发起连接（防弹衣核心：这里包住所有可能的原生异常）
+        // 3) 真正发起连接 —— 这一步会经 JNI 调用 FreeRDP 的 freerdp_connect()。
+        //    防弹衣核心：包住所有可能的原生异常。
         return try {
+            Log.i(TAG, "调用 nativeConnect：${config.host.trim()}:$port " +
+                    "user=${config.username} domain=${config.domain} " +
+                    "security=${config.securityLevel} audio=${config.enableAudio}")
             val ok = FreerdpJni.nativeConnect(
                 config.host.trim(), port, config.username,
                 config.password, config.domain, config.enableAudio, config.securityLevel
             )
+            Log.i(TAG, "nativeConnect 返回：$ok")
             connected = ok
             if (ok) {
                 // 音频开关设置失败不影响连接本身
@@ -99,6 +118,11 @@ class NativeTransport : RdpTransport {
     }
 
     override fun send(action: KeyAction) {
+        // 未连接时不允许发送 —— 否则就是"对着空气打字"还骗用户说发出去了。
+        if (!isConnected) {
+            Log.w(TAG, "未连接，忽略按键：${action.key.label}")
+            return
+        }
         try {
             FreerdpJni.sendKeyAction(action)
         } catch (t: Throwable) {

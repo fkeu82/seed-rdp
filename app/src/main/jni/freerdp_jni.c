@@ -566,9 +566,25 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	}
 
 	/* ---- 4) 发起连接（可能阻塞，Kotlin 侧在 IO 线程调用）---- */
-	__android_log_print(ANDROID_LOG_INFO, TAG, "正在连接 %s:%d", hostStr, (int)s->ServerPort);
+	__android_log_print(ANDROID_LOG_INFO, TAG,
+	                    "=== 开始真实 RDP 连接 === 目标=%s:%d 用户=%s 域=%s 安全级别=%d 音频=%d",
+	                    hostStr, (int)s->ServerPort,
+	                    (userStr != NULL && userStr[0] != '\0') ? userStr : "(空)",
+	                    (domStr != NULL && domStr[0] != '\0') ? domStr : "(空)",
+	                    (int)securityLevel, enableAudio ? 1 : 0);
+
 	BOOL ok = FALSE;
 	ok = freerdp_connect(instance);
+
+	/* 【需求 3】真实连接日志：无论成功失败，都必须打印
+	 * IP、端口、freerdp_connect 返回值、freerdp_get_last_error_string。 */
+	__android_log_print(ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, TAG,
+	                    "=== freerdp_connect 返回 === 目标=%s:%d 返回值=%s 错误码=0x%08X 错误描述=%s",
+	                    hostStr, (int)s->ServerPort,
+	                    ok ? "TRUE" : "FALSE",
+	                    (unsigned)freerdp_get_last_error(instance->context),
+	                    freerdp_get_last_error_string(
+	                        freerdp_get_last_error(instance->context)));
 
 	if (!ok)
 	{
