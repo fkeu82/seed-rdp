@@ -160,14 +160,16 @@ class RdpViewModel : ViewModel() {
                 is ConnectionResult.Success ->
                     _announcement.value = "已连接，键盘已显示"
                 is ConnectionResult.Failure -> {
-                    // 播报策略：给出可执行的主提示 + 底层真实原因，便于用户自查与反馈。
-                    // 例如 TLS 失败 / 认证失败 / DNS 失败 / 端口不通，都会体现在 reason 里。
+                    // 播报策略：**直接以底层真实原因为主**，前面不再强行加一句
+                    // "请检查主机和端口"——因为原因可能是认证失败、安全层不匹配等，
+                    // 那句笼统提示会把用户往错误方向引导。
+                    // 底层原因现在保证有内容（TCP 预检 + RDP 握手阶段的分类提示）。
                     val reason = result.reason
                     Log.w(TAG, "连接失败原因：$reason")
                     _announcement.value = if (reason.isBlank()) {
-                        "连接失败，请检查主机和端口"
+                        "连接失败，请检查主机和端口是否正确"
                     } else {
-                        "连接失败，请检查主机和端口。原因：$reason"
+                        "连接失败。$reason"
                     }
                     // 同时把失败原因落到日志文件，方便用户回传
                     try {
