@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <time.h>
 #include <android/log.h>
 
@@ -52,8 +53,72 @@ static freerdp* g_instance = NULL;
 /* AudioRedirect.setEnabled(boolean) 的 jmethodID（JNI_OnLoad 时缓存）。 */
 static jmethodID g_setEnabled = NULL;
 
+/* 【v1.1.4】FreerdpJni.onNativeLog(String, String) 的全局引用与方法 ID。
+ * 用于把 C 层日志同步写进 Kotlin 的日志文件（Download/AccessRDP/run-*.txt），
+ * 让「没有电脑、装不了 adb」的用户也能直接看到原生日志。 */
+static jclass    g_freerdpJniCls   = NULL;
+static jmethodID g_onNativeLog     = NULL;
+
 /* 最近一次连接失败的详细信息（供 Kotlin 通过 nativeGetLastError 取回并播报）。 */
 static char g_last_error[1024] = { 0 };
+
+/* ------------------------------------------------------------------ */
+/* 统一日志出口：logcat + Kotlin 文件                                    */
+/*                                                                     */
+/* 背景：C 层原本只用 __android_log_print，日志**只进 logcat**，不进用户  */
+/* 能看到的 Download/AccessRDP/run-*.txt。结果排查时用户只能看到「连接    */
+/* 失败」这种结果行，看不到「金丝雀」这种过程行。                        */
+/*                                                                     */
+/* 本函数做两件事：                                                     */
+/*   1) __android_log_print  -> logcat（开发者用）                      */
+/*   2) 回调 FreerdpJni.onNativeLog -> 落盘（用户直接看文件用）          */
+/* ------------------------------------------------------------------ */
+static void accessrdp_log(int prio, const char* fmt, ...)
+{
+	char buf[2048];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	/* 1) 始终打 logcat */
+	__android_log_print(prio, TAG, "%s", buf);
+
+	/* 2) 尽力落盘到用户可见的日志文件（失败绝不能影响主流程） */
+	if (g_vm != NULL && g_freerdpJniCls != NULL && g_onNativeLog != NULL)
+	{
+		JNIEnv* env = NULL;
+		/* 已有线程附着则复用；未附着时尝试附着（只在本线程首次产生日志时发生） */
+		jint st = (*g_vm)->GetEnv(g_vm, (void**)&env, JNI_VERSION_1_6);
+		BOOL attached = FALSE;
+		if (st == JNI_EDETACHED)
+		{
+			/* C 与 C++ 的 jni.h 对 AttachCurrentThread 的签名不同，
+			 * 显式转成 JNIEnv** 消除 -Wincompatible-pointer-types。 */
+			if ((*g_vm)->AttachCurrentThread(g_vm, (JNIEnv**)&env, NULL) != JNI_OK)
+				return;
+			attached = TRUE;
+		}
+		else if (st != JNI_OK)
+		{
+			return;
+		}
+
+		jstring jmsg = (*env)->NewStringUTF(env, buf);
+		if (jmsg != NULL)
+		{
+			(*env)->CallStaticVoidMethod(env, g_freerdpJniCls, g_onNativeLog,
+			                             (*env)->NewStringUTF(env, "JNI"), jmsg);
+			/* 回调若抛异常（例如 Kotlin 侧构造失败），必须清掉，否则后续 JNI 调用会莫名失败 */
+			if ((*env)->ExceptionCheck(env))
+				(*env)->ExceptionClear(env);
+			(*env)->DeleteLocalRef(env, jmsg);
+		}
+
+		if (attached)
+			(*g_vm)->DetachCurrentThread(g_vm);
+	}
+}
 
 /* 键盘扫描码：扩展位来自 Kotlin 约定的 0xE000；RDP 侧的 KBDEXT 由
  * MAKE_RDP_SCANCODE 宏（freerdp/scancode.h，经 input.h 引入）自动处理。 */
@@ -142,6 +207,32 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
 		(*env)->ExceptionClear(env);
 		__android_log_print(ANDROID_LOG_ERROR, TAG, "无法找到 AudioRedirect 类");
 	}
+
+	/* 【v1.1.4】缓存 FreerdpJni 类的全局引用 + onNativeLog 方法 ID，
+	 * 供 C 层日志转发到 Kotlin 文件使用。
+	 * 注意：FindClass 在 JNI_OnLoad 里用的是系统类加载器，能找到 App 的类；
+	 * 而连接发生在别的线程，那里再 FindClass 很可能失败（类加载器不同），
+	 * 所以必须在这里缓存成 GlobalRef。 */
+	jclass fjni = (*env)->FindClass(env, "com/accessrdp/client/jni/FreerdpJni");
+	if (fjni != NULL)
+	{
+		g_freerdpJniCls = (jclass)(*env)->NewGlobalRef(env, fjni);
+		g_onNativeLog = (*env)->GetStaticMethodID(
+		    env, fjni, "onNativeLog", "(Ljava/lang/String;Ljava/lang/String;)V");
+		if (g_onNativeLog == NULL)
+		{
+			(*env)->ExceptionClear(env);
+			__android_log_print(ANDROID_LOG_WARN, TAG,
+			                    "未找到 FreerdpJni.onNativeLog —— 原生日志将不进文件");
+		}
+		(*env)->DeleteLocalRef(env, fjni);
+	}
+	else
+	{
+		(*env)->ExceptionClear(env);
+		__android_log_print(ANDROID_LOG_WARN, TAG, "无法找到 FreerdpJni 类");
+	}
+
 	return JNI_VERSION_1_6;
 }
 
@@ -184,7 +275,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 
 	/* 【需求 1】入口追踪日志：证明 nativeConnect 确实被调用、参数是什么。
 	 * 用于排查「Kotlin 侧是否真的走到了原生连接」这类问题。 */
-	__android_log_print(ANDROID_LOG_INFO, TAG,
+	accessrdp_log(ANDROID_LOG_INFO, TAG,
 	                    ">>> JNI nativeConnect 被调用 (port=%d, secLevel=%d)",
 	                    (int)port, (int)securityLevel);
 
@@ -210,7 +301,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	 * 写 g_last_error，保证失败原因一路带到 UI。 */
 	if (host == NULL)
 	{
-		__android_log_print(ANDROID_LOG_ERROR, TAG, "主机地址为空，放弃连接");
+		accessrdp_log(ANDROID_LOG_ERROR, TAG, "主机地址为空，放弃连接");
 		snprintf(g_last_error, sizeof(g_last_error),
 		         "主机地址为空（JNI 收到 NULL）。请在连接界面填写目标 IP 或主机名。");
 		return JNI_FALSE;
@@ -218,7 +309,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	hostStr = (*env)->GetStringUTFChars(env, host, NULL);
 	if (hostStr == NULL || hostStr[0] == '\0')
 	{
-		__android_log_print(ANDROID_LOG_ERROR, TAG, "主机地址非法，放弃连接");
+		accessrdp_log(ANDROID_LOG_ERROR, TAG, "主机地址非法，放弃连接");
 		snprintf(g_last_error, sizeof(g_last_error),
 		         "主机地址为空字符串，无法连接。请填写目标 IP 或主机名。");
 		goto cleanup;
@@ -244,12 +335,12 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	 * 拿到真实错误码并给出分类提示（见下方 !ok 分支）。 */
 
 	/* ---- 2) 创建实例 ---- */
-	__android_log_print(ANDROID_LOG_INFO, TAG,
+	accessrdp_log(ANDROID_LOG_INFO, TAG,
 	                    "步骤 2/6：freerdp_new() 创建实例…");
 	instance = freerdp_new();
 	if (instance == NULL)
 	{
-		__android_log_print(ANDROID_LOG_ERROR, TAG, "freerdp_new 失败");
+		accessrdp_log(ANDROID_LOG_ERROR, TAG, "freerdp_new 失败");
 		snprintf(g_last_error, sizeof(g_last_error),
 		         "内部错误：FreeRDP 实例创建失败（freerdp_new 返回 NULL），"
 		         "连接未能发起。这通常意味着原生库未正确加载或内存不足。");
@@ -257,7 +348,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	}
 
 	/* [崩溃点 2 修复] context 创建必须检查返回值 */
-	__android_log_print(ANDROID_LOG_INFO, TAG,
+	accessrdp_log(ANDROID_LOG_INFO, TAG,
 	                    "步骤 3/6：freerdp_context_new() 创建上下文…");
 
 	/* 【v1.1.3 诊断金丝雀】freerdp_context_new() 内部有十几个子分配，
@@ -277,19 +368,19 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	 * 注意：这些是**独立的探针对象**，用完立即释放，不影响后续真正的创建。 */
 	{
 		rdpContext* probeCtx = (rdpContext*)calloc(1, instance->ContextSize);
-		__android_log_print(ANDROID_LOG_INFO, TAG,
+		accessrdp_log(ANDROID_LOG_INFO, TAG,
 		                    "  [金丝雀1] calloc(ContextSize=%zu) = %s",
 		                    instance->ContextSize, probeCtx ? "OK" : "NULL(失败)");
 
 		if (probeCtx)
 		{
 			wPubSub* ps = PubSub_New(TRUE);
-			__android_log_print(ANDROID_LOG_INFO, TAG,
+			accessrdp_log(ANDROID_LOG_INFO, TAG,
 			                    "  [金丝雀2] PubSub_New = %s", ps ? "OK" : "NULL(失败)");
 			if (ps) PubSub_Free(ps);
 
 			rdpMetrics* mt = metrics_new(probeCtx);
-			__android_log_print(ANDROID_LOG_INFO, TAG,
+			accessrdp_log(ANDROID_LOG_INFO, TAG,
 			                    "  [金丝雀3] metrics_new = %s", mt ? "OK" : "NULL(失败)");
 			/* metrics_new 会挂到 context 上，随 probeCtx 一起在下文释放，故不单独 free */
 
@@ -298,19 +389,19 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 		}
 
 		HANDLE ev = CreateEvent(NULL, TRUE, FALSE, NULL);
-		__android_log_print(ANDROID_LOG_INFO, TAG,
+		accessrdp_log(ANDROID_LOG_INFO, TAG,
 		                    "  [金丝雀4] CreateEvent = %s", ev ? "OK" : "NULL(失败)");
 		if (ev) CloseHandle(ev);
 
 		rdpSettings* probeSettings = freerdp_settings_new(0);
-		__android_log_print(ANDROID_LOG_INFO, TAG,
+		accessrdp_log(ANDROID_LOG_INFO, TAG,
 		                    "  [金丝雀5] freerdp_settings_new = %s (约 %zu 字节)",
 		                    probeSettings ? "OK" : "NULL(失败)", sizeof(rdpSettings));
 		if (probeSettings) freerdp_settings_free(probeSettings);
 
 		CRITICAL_SECTION cs;
 		BOOL csOk = InitializeCriticalSectionAndSpinCount(&cs, 4000);
-		__android_log_print(ANDROID_LOG_INFO, TAG,
+		accessrdp_log(ANDROID_LOG_INFO, TAG,
 		                    "  [金丝雀6] InitializeCriticalSection = %s",
 		                    csOk ? "OK" : "NULL(失败)");
 		if (csOk) DeleteCriticalSection(&cs);
@@ -324,14 +415,14 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 		/* 【v1.1.3 自愈重试】真机实测 freerdp_context_new() 会失败，而 Linux 上正常。
 		 * 这类失败常常是一次性的（瞬时内存紧张、pthread/sem 原语初始化抖动）。
 		 * 这里丢掉旧实例、换一个全新实例再试一次 —— 成本很低，但可能直接救回来。 */
-		__android_log_print(ANDROID_LOG_WARN, TAG,
+		accessrdp_log(ANDROID_LOG_WARN, TAG,
 		                    "freerdp_context_new 第 1 次失败，换新实例重试一次…");
 		freerdp_free(instance);
 		instance = freerdp_new();
 		if (instance != NULL)
 		{
 			ctxOk = freerdp_context_new(instance);
-			__android_log_print(ANDROID_LOG_INFO, TAG,
+			accessrdp_log(ANDROID_LOG_INFO, TAG,
 			                    "重试结果：freerdp_context_new = %s, context = %p",
 			                    ctxOk ? "TRUE" : "FALSE", (void*)instance->context);
 		}
@@ -339,7 +430,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 
 	if (!ctxOk || instance == NULL || instance->context == NULL)
 	{
-		__android_log_print(ANDROID_LOG_ERROR, TAG,
+		accessrdp_log(ANDROID_LOG_ERROR, TAG,
 		                    "freerdp_context_new 失败（已重试一次仍失败）");
 		snprintf(g_last_error, sizeof(g_last_error),
 		         "内部错误：FreeRDP 上下文创建失败（freerdp_context_new 连续两次返回失败），"
@@ -354,7 +445,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	}
 	if (instance->settings == NULL)
 	{
-		__android_log_print(ANDROID_LOG_ERROR, TAG, "settings 为空");
+		accessrdp_log(ANDROID_LOG_ERROR, TAG, "settings 为空");
 		snprintf(g_last_error, sizeof(g_last_error),
 		         "内部错误：FreeRDP 配置对象为空（settings == NULL），连接未能发起。");
 		freerdp_free(instance);
@@ -455,18 +546,18 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 		if (freerdp_channels_load_plugin(instance->context->channels,
 		                                 instance->settings, "rdpsnd", NULL) <= 0)
 		{
-			__android_log_print(ANDROID_LOG_WARN, TAG,
+			accessrdp_log(ANDROID_LOG_WARN, TAG,
 			                    "加载 rdpsnd 插件失败，远端音频可能不可用");
 		}
 	}
 	else
 	{
-		__android_log_print(ANDROID_LOG_WARN, TAG,
+		accessrdp_log(ANDROID_LOG_WARN, TAG,
 		                    "channels 为空，跳过 rdpsnd 插件加载");
 	}
 
 	/* ---- 4) 发起连接（可能阻塞，Kotlin 侧在 IO 线程调用）---- */
-	__android_log_print(ANDROID_LOG_INFO, TAG,
+	accessrdp_log(ANDROID_LOG_INFO, TAG,
 	                    "=== 开始真实 RDP 连接 === 目标=%s:%d 用户=%s 域=%s 安全级别=%d 音频=%d",
 	                    hostStr, (int)s->ServerPort,
 	                    (userStr != NULL && userStr[0] != '\0') ? userStr : "(空)",
@@ -476,7 +567,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	/* 【需求 2/3】打印实际生效的安全层配置，证明 TLS/NLA 标志到底开没开。
 	 * 若 TlsSecurity/NlaSecurity 全为 FALSE，FreeRDP 会只发裸 X.224 CR；
 	 * 若为 TRUE，则会在协商后主动发起 TLS ClientHello。 */
-	__android_log_print(ANDROID_LOG_INFO, TAG,
+	accessrdp_log(ANDROID_LOG_INFO, TAG,
 	                    "安全层生效配置: RdpSecurity=%d TlsSecurity=%d NlaSecurity=%d "
 	                    "NegotiateSecurityLayer=%d Authentication=%d ExtSecurity=%d "
 	                    "TLSMin=0x%04X TLSMax=0x%04X",
@@ -492,7 +583,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	 * 若 logcat 里看到了这一行、但服务器端没有任何连接记录，
 	 * 说明 socket 建立阶段（freerdp_tcp_connect -> DNS/getaddrinfo/connect）
 	 * 在设备侧就失败了 —— 而不是握手包发错。 */
-	__android_log_print(ANDROID_LOG_INFO, TAG,
+	accessrdp_log(ANDROID_LOG_INFO, TAG,
 	                    "步骤 6/6：即将调用 freerdp_connect() —— "
 	                    "若此后 logcat 无更多输出且服务器无连接，问题在 TCP/DNS 层。 "
 	                    "目标 %s:%d", hostStr, (int)s->ServerPort);
@@ -506,7 +597,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 
 	/* 【需求 3】真实连接日志：无论成功失败，都必须打印
 	 * IP、端口、freerdp_connect 返回值、freerdp_get_last_error_string、耗时。 */
-	__android_log_print(ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, TAG,
+	accessrdp_log(ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, TAG,
 	                    "=== freerdp_connect 返回 === 目标=%s:%d 返回值=%s 耗时=%ldms "
 	                    "错误码=0x%08X 名称=%s 错误描述=%s",
 	                    hostStr, (int)s->ServerPort,
@@ -534,7 +625,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 		const char* errStr  = freerdp_get_last_error_string(errCode);
 		const char* errCat  = freerdp_get_last_error_category(errCode);
 
-		__android_log_print(ANDROID_LOG_ERROR, TAG,
+		accessrdp_log(ANDROID_LOG_ERROR, TAG,
 		                    "freerdp_connect 失败 %s:%d 错误码=0x%08X 名称=%s 分类=%s 描述=%s",
 		                    hostStr, (int)s->ServerPort,
 		                    (unsigned)errCode,
@@ -645,7 +736,7 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	g_instance = instance;
 	instance = NULL;                 /* 防止 cleanup 误释放已移交的实例 */
 	result = JNI_TRUE;
-	__android_log_print(ANDROID_LOG_INFO, TAG, "连接成功 %s:%d", hostStr, (int)s->ServerPort);
+	accessrdp_log(ANDROID_LOG_INFO, TAG, "连接成功 %s:%d", hostStr, (int)s->ServerPort);
 
 cleanup:
 	if (hostStr) (*env)->ReleaseStringUTFChars(env, host, hostStr);
@@ -670,8 +761,8 @@ cleanup:
 		         "连接 %s 未能发起（原生层未返回具体错误）。"
 		         "可能是内部初始化失败，请卸载后重装本应用并重试。",
 		         hostStr ? hostStr : "(未知主机)");
-		__android_log_print(ANDROID_LOG_ERROR, TAG,
-		                    "⚠️ 失败路径未写入 g_last_error，已补兜底文案（这是代码缺陷，请反馈）");
+		accessrdp_log(ANDROID_LOG_ERROR,
+		              "⚠️ 失败路径未写入 g_last_error，已补兜底文案（这是代码缺陷，请反馈）");
 	}
 
 	return result;

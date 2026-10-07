@@ -25,8 +25,8 @@ plugins {
  *
  * 这样即使有人在 CI 里漏改常量，只要 tag 打对了，APK 里的版本号就绝不会错。
  */
-val fallbackVersionName = "1.1.3"
-val fallbackVersionCode = 10103
+val fallbackVersionName = "1.1.4"
+val fallbackVersionCode = 10104
 
 /**
  * 由版本名推导 versionCode：major*10000 + minor*100 + patch。

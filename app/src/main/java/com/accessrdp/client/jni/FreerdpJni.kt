@@ -1,6 +1,7 @@
 package com.accessrdp.client.jni
 
 import android.util.Log
+import com.accessrdp.client.CrashLogger
 import com.accessrdp.client.keymodel.KeyAction
 import com.accessrdp.client.keymodel.KeyActionType
 
@@ -191,6 +192,40 @@ object FreerdpJni {
             AudioRedirect.release()
         } catch (e: Throwable) {
             Log.e(TAG, "onAudioStop 失败", e)
+        }
+    }
+
+    // ---------------- 原生日志转发（供用户直接看文件） ----------------
+
+    /**
+     * 【v1.1.4 新增】原生层（C/C++）的日志回调。
+     *
+     * 背景：C 层的 `__android_log_print` 只进 logcat，不进 CrashLogger 写的
+     * `Download/AccessRDP/run-*.txt`。而多数用户**没有电脑、装不了 adb**，
+     * 只能看那个文件。于是排查时看到的永远只有「连接失败」这种结果行，
+     * 看不到「金丝雀」这种过程行 —— 等于读了跟没读一样。
+     *
+     * 本方法由 C 层的 `accessrdp_log()` 主动调用（JNI_OnLoad 缓存全局引用 +
+     * CallStaticVoidMethod），把原生关键日志**同时**写进 CrashLogger 的日志文件，
+     * 用户直接翻文件就能看到全过程，不需要 adb。
+     *
+     * @param tag     原生日志的分区标签（如 "JNI"）
+     * @param message 日志正文
+     */
+    @JvmStatic
+    fun onNativeLog(tag: String, message: String) {
+        // 先打 logcat（不依赖 Context，永远可用）
+        try {
+            Log.i("AccessRDP/Native", "[$tag] $message")
+        } catch (t: Throwable) {
+            // 忽略
+        }
+        // 再落文件（需要 Application 实例；拿不到就只留 logcat）
+        try {
+            val ctx = com.accessrdp.client.AccessRdpApp.instance ?: return
+            CrashLogger.log(ctx, "原生-$tag", message)
+        } catch (t: Throwable) {
+            // 写文件失败绝不能影响连接流程
         }
     }
 }
