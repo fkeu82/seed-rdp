@@ -25,15 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
+#include <time.h>
 #include <android/log.h>
 
 #include <freerdp/freerdp.h>
@@ -149,215 +141,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
 /* 连接 / 断开                                                         */
 /* ------------------------------------------------------------------ */
 
-/* ------------------------------------------------------------------ */
-/* 【自诊断】连接前的 TCP 预检                                          */
-/*                                                                     */
-/* 为什么需要它：                                                       */
-/*   FreeRDP 的 freerdp_connect() 在 TCP 层失败时，内部会走            */
-/*   freerdp_reconnect() 重试，而重试路径里有一句                       */
-/*   freerdp_set_last_error_log(context, 0) —— 会把 last_error 清成 0。 */
-/*   结果就是：连接明明失败，freerdp_get_last_error() 却返回 0，        */
-/*   我们只能给用户播报一句无用的「底层未返回具体原因」。               */
-/*                                                                     */
-/*   与其依赖 FreeRDP 不可靠的错误码，不如在调用它之前，**自己先探一次 */
-/*   TCP**。这样能拿到操作系统层面最精确的失败原因：                    */
-/*     - 域名解析失败        -> 无法解析主机地址                       */
-/*     - 连接被拒(REFUSED)   -> 端口上没有服务在监听（最常见！）         */
-/*     - 连接超时(TIMEOUT)   -> 被防火墙/云安全组丢包，或主机不可达      */
-/*     - 连接成功            -> TCP 层没问题，继续交给 FreeRDP 做 RDP 握手 */
-/*                                                                     */
-/* 返回：0 = TCP 可达（继续）；非 0 = 已失败，g_last_error 已写好。      */
-/* ------------------------------------------------------------------ */
-static int tcp_preflight(const char* host, int port, int timeoutMs)
-{
-	struct addrinfo hints;
-	struct addrinfo* res = NULL;
-	char portStr[16];
-	int rc;
-	int fd = -1;
-	int result = -9;
-
-	if (host == NULL || host[0] == '\0')
-	{
-		snprintf(g_last_error, sizeof(g_last_error), "主机地址为空");
-		return -1;
-	}
-	if (port <= 0 || port > 65535)
-	{
-		snprintf(g_last_error, sizeof(g_last_error),
-		         "端口号非法（%d），应为 1-65535", port);
-		return -1;
-	}
-
-	snprintf(portStr, sizeof(portStr), "%d", port);
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family   = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-
-	/* --- 第一步：解析主机 --- */
-	rc = getaddrinfo(host, portStr, &hints, &res);
-	if (rc != 0 || res == NULL)
-	{
-		snprintf(g_last_error, sizeof(g_last_error),
-		         "无法解析主机地址「%s」（%s）。请检查 IP 是否写错，或改用 IP 直连",
-		         host, gai_strerror(rc));
-		__android_log_print(ANDROID_LOG_ERROR, TAG,
-		                    "预检失败：DNS 解析 %s 失败 rc=%d (%s)", host, rc, gai_strerror(rc));
-		if (res) freeaddrinfo(res);
-		return -1;
-	}
-
-	/* --- 第二步：逐个地址尝试 TCP 连接（非阻塞 + select 实现超时） --- */
-	{
-		struct addrinfo* ai;
-		int lastErrno = 0;
-		int tried = 0;
-
-		for (ai = res; ai != NULL; ai = ai->ai_next)
-		{
-			int flags;
-			fd_set wfds;
-			struct timeval tv;
-			int soerr = 0;
-			socklen_t soerrLen = sizeof(soerr);
-			char ipbuf[64] = { 0 };
-
-			if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6)
-				continue;
-
-			tried++;
-
-			if (ai->ai_family == AF_INET)
-			{
-				struct sockaddr_in* v4 = (struct sockaddr_in*)ai->ai_addr;
-				inet_ntop(AF_INET, &v4->sin_addr, ipbuf, sizeof(ipbuf));
-			}
-			else
-			{
-				struct sockaddr_in6* v6 = (struct sockaddr_in6*)ai->ai_addr;
-				inet_ntop(AF_INET6, &v6->sin6_addr, ipbuf, sizeof(ipbuf));
-			}
-
-			fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-			if (fd < 0)
-			{
-				lastErrno = errno;
-				continue;
-			}
-
-			/* 设为非阻塞，交给 select 控制超时 */
-			flags = fcntl(fd, F_GETFL, 0);
-			fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-
-			rc = connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen);
-			if (rc == 0)
-			{
-				/* 立刻连上（本机/内网常见） */
-				result = 0;
-				close(fd);
-				fd = -1;
-				goto done;
-			}
-
-			if (errno != EINPROGRESS)
-			{
-				lastErrno = errno;
-				close(fd);
-				fd = -1;
-				continue;
-			}
-
-			/* 等待可写（连接完成或失败） */
-			FD_ZERO(&wfds);
-			FD_SET(fd, &wfds);
-			tv.tv_sec  = timeoutMs / 1000;
-			tv.tv_usec = (timeoutMs % 1000) * 1000;
-
-			rc = select(fd + 1, NULL, &wfds, NULL, &tv);
-			if (rc <= 0)
-			{
-				/* 超时 */
-				snprintf(g_last_error, sizeof(g_last_error),
-				         "连接 %s:%d 超时（目标 %s）。网络不可达，或该端口被防火墙/云安全组拦截。",
-				         host, port, ipbuf);
-				__android_log_print(ANDROID_LOG_ERROR, TAG,
-				                    "预检失败：连接 %s:%d (%s) 超时", host, port, ipbuf);
-				close(fd);
-				fd = -1;
-				result = -2;
-				goto done;
-			}
-
-			/* 可写：检查 SO_ERROR 判断成功还是被拒 */
-			if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen) < 0)
-				soerr = errno;
-
-			if (soerr == 0)
-			{
-				result = 0;
-				close(fd);
-				fd = -1;
-				goto done;
-			}
-
-			/* 记录本地址的失败原因，继续尝试下一个地址 */
-			lastErrno = soerr;
-			close(fd);
-			fd = -1;
-
-			if (soerr == ECONNREFUSED)
-			{
-				snprintf(g_last_error, sizeof(g_last_error),
-				         "服务器 %s 的 %d 端口拒绝连接（Connection refused）。"
-				         "说明该端口上没有任何程序在监听 —— 端口号很可能填错了，"
-				         "请确认远程桌面服务真正监听的端口（Windows 默认是 3389）。",
-				         host, port);
-			}
-			else if (soerr == EHOSTUNREACH || soerr == ENETUNREACH)
-			{
-				snprintf(g_last_error, sizeof(g_last_error),
-				         "无法到达主机 %s（%s）。请检查网络连接。", host, ipbuf);
-			}
-			else if (soerr == ETIMEDOUT)
-			{
-				snprintf(g_last_error, sizeof(g_last_error),
-				         "连接 %s:%d 超时。可能被防火墙/云安全组拦截。", host, port);
-			}
-			else
-			{
-				snprintf(g_last_error, sizeof(g_last_error),
-				         "连接 %s:%d 失败（%s）。", host, port, strerror(soerr));
-			}
-			result = -2;
-		}
-
-		if (tried == 0)
-		{
-			snprintf(g_last_error, sizeof(g_last_error),
-			         "主机「%s」没有可用的 IPv4/IPv6 地址。", host);
-			result = -1;
-		}
-		else if (result == -9)
-		{
-			snprintf(g_last_error, sizeof(g_last_error),
-			         "连接 %s:%d 失败（%s）。", host, port,
-			         lastErrno ? strerror(lastErrno) : "未知原因");
-			result = -2;
-		}
-	}
-
-done:
-	if (fd >= 0) close(fd);
-	if (res) freeaddrinfo(res);
-
-	if (result == 0)
-	{
-		__android_log_print(ANDROID_LOG_INFO, TAG,
-		                    "预检通过：TCP %s:%d 可达，继续 RDP 握手", host, port);
-	}
-	return result;
-}
-
 /*
  * 建立 RDP 会话。
  *
@@ -391,6 +174,12 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	const char* passStr = NULL;
 	const char* domStr  = NULL;
 
+	/* 【需求 1】入口追踪日志：证明 nativeConnect 确实被调用、参数是什么。
+	 * 用于排查「Kotlin 侧是否真的走到了原生连接」这类问题。 */
+	__android_log_print(ANDROID_LOG_INFO, TAG,
+	                    ">>> JNI nativeConnect 被调用 (port=%d, secLevel=%d)",
+	                    (int)port, (int)securityLevel);
+
 	/* 每次连接先清空上一次的错误描述，避免旧错误被误播报。 */
 	g_last_error[0] = '\0';
 	jboolean result = JNI_FALSE;
@@ -420,23 +209,21 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	passStr = pass   ? (*env)->GetStringUTFChars(env, pass, NULL)   : NULL;
 	domStr  = domain ? (*env)->GetStringUTFChars(env, domain, NULL) : NULL;
 
-	/* ---- 1.5) 【关键】连接前先做 TCP 预检 ----
+	/* ---- 1.5) 【已移除 TCP 预检】----
 	 *
-	 * 理由见 tcp_preflight() 上方注释：FreeRDP 在 TCP 失败后会内部重试并把
-	 * last_error 清成 0，导致用户只能看到一句「底层未返回具体原因」。
-	 * 这里我们自己先探一次，拿到操作系统层面最精确的失败原因。
+	 * 历史：v1.0.6 曾在此处先做一次独立的 TCP 预检（connect + close，不发任何数据）。
 	 *
-	 * 预检不通过就直接返回，既省掉 FreeRDP 内部漫长的重试等待，
-	 * 也能给用户一句真正有用的中文提示。 */
-	{
-		int pre = tcp_preflight(hostStr, (int)port, 10000);
-		if (pre != 0)
-		{
-			__android_log_print(ANDROID_LOG_ERROR, TAG,
-			                    "TCP 预检失败 %s:%d -> %s", hostStr, (int)port, g_last_error);
-			goto cleanup;   /* g_last_error 已被预检写好，直接带回 Kotlin 播报 */
-		}
-	}
+	 * 【为什么删掉】这个预检有严重副作用：
+	 *   它会在目标服务器的连接日志里留下一条「连接进来、但一个字节都没发就断开」
+	 *   的幽灵记录，极易被误判为「客户端不发 RDP 握手包」的 bug。
+	 *   实测（Linux 版 FreeRDP 对照实验）证明：真正的 freerdp_connect() 会
+	 *   正常发出 46 字节的 X.224 Connection Request + RDP Negotiation Request
+	 *   （0300002e29e00000000000...0100080003000000），握手流程完全正常。
+	 *
+	 *   因此预检属于「制造问题假象」的多余步骤，已彻底删除。
+	 *
+	 * 现在改为：直接交给 FreeRDP 连接；若失败，再用 freerdp_get_last_error_* 
+	 * 拿到真实错误码并给出分类提示（见下方 !ok 分支）。 */
 
 	/* ---- 2) 创建实例 ---- */
 	instance = freerdp_new();
@@ -573,16 +360,38 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	                    (domStr != NULL && domStr[0] != '\0') ? domStr : "(空)",
 	                    (int)securityLevel, enableAudio ? 1 : 0);
 
+	/* 【需求 2/3】打印实际生效的安全层配置，证明 TLS/NLA 标志到底开没开。
+	 * 若 TlsSecurity/NlaSecurity 全为 FALSE，FreeRDP 会只发裸 X.224 CR；
+	 * 若为 TRUE，则会在协商后主动发起 TLS ClientHello。 */
+	__android_log_print(ANDROID_LOG_INFO, TAG,
+	                    "安全层生效配置: RdpSecurity=%d TlsSecurity=%d NlaSecurity=%d "
+	                    "NegotiateSecurityLayer=%d Authentication=%d ExtSecurity=%d "
+	                    "TLSMin=0x%04X TLSMax=0x%04X",
+	                    s->RdpSecurity, s->TlsSecurity, s->NlaSecurity,
+	                    s->NegotiateSecurityLayer, s->Authentication, s->ExtSecurity,
+	                    (unsigned)s->TLSMinVersion, (unsigned)s->TLSMaxVersion);
+
+	/* 记录连接耗时，便于判断是"秒失败"（TCP 层被拒）还是"卡到超时"（被丢包） */
+	struct timespec tsStart, tsEnd;
+	clock_gettime(CLOCK_MONOTONIC, &tsStart);
+
 	BOOL ok = FALSE;
 	ok = freerdp_connect(instance);
 
+	clock_gettime(CLOCK_MONOTONIC, &tsEnd);
+	long elapsedMs = (tsEnd.tv_sec - tsStart.tv_sec) * 1000L
+	               + (tsEnd.tv_nsec - tsStart.tv_nsec) / 1000000L;
+
 	/* 【需求 3】真实连接日志：无论成功失败，都必须打印
-	 * IP、端口、freerdp_connect 返回值、freerdp_get_last_error_string。 */
+	 * IP、端口、freerdp_connect 返回值、freerdp_get_last_error_string、耗时。 */
 	__android_log_print(ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, TAG,
-	                    "=== freerdp_connect 返回 === 目标=%s:%d 返回值=%s 错误码=0x%08X 错误描述=%s",
+	                    "=== freerdp_connect 返回 === 目标=%s:%d 返回值=%s 耗时=%ldms "
+	                    "错误码=0x%08X 名称=%s 错误描述=%s",
 	                    hostStr, (int)s->ServerPort,
-	                    ok ? "TRUE" : "FALSE",
+	                    ok ? "TRUE" : "FALSE", elapsedMs,
 	                    (unsigned)freerdp_get_last_error(instance->context),
+	                    freerdp_get_last_error_name(
+	                        freerdp_get_last_error(instance->context)),
 	                    freerdp_get_last_error_string(
 	                        freerdp_get_last_error(instance->context)));
 
@@ -611,37 +420,68 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 		                    errCat ? errCat : "?",
 		                    errStr ? errStr : "?");
 
-		/* errStr 为空、或是无意义的 UNKNOWN[0x0]，说明 FreeRDP 没能给出有效原因。
-		 * 此时 TCP 已经通了（预检通过才会走到这里），所以问题一定出在
-		 * RDP 协议/安全层/认证阶段，据此给一段有指向性的提示。 */
-		if (errStr == NULL || errStr[0] == '\0' ||
-		    strncmp(errStr, "UNKNOWN", 7) == 0)
+		/* 按 FreeRDP 的**真实错误码**分类给出可指导排查的中文提示。
+		 *
+		 * 重要：这里不再假设"TCP 必然已通"（旧版依赖已删除的 TCP 预检做此假设，
+		 * 是错的）。现在完全依据 FreeRDP 返回的 errCode / errStr 判断卡在哪一层。
+		 *
+		 * 常见错误码（winpr/error.h）：
+		 *   0x0002000D ERRCONNECT_CONNECT_TRANSPORT_FAILED      -> TCP 层就没连上
+		 *   0x0002000C ERRCONNECT_SECURITY_NEGO_CONNECT_FAILED  -> 安全协商失败
+		 *   0x00020009 ERRCONNECT_AUTHENTICATION_FAILED         -> 认证失败
+		 *   0x0002000E/0F ... TLS/证书相关
+		 */
+		BOOL isTransportFailed = (errCode == 0x0002000D);   /* CONNECT_TRANSPORT_FAILED */
+		BOOL isNegoFailed      = (errCode == 0x0002000C);   /* SECURITY_NEGO_CONNECT_FAILED */
+
+		if (isTransportFailed)
 		{
+			/* TCP 层失败：连接根本没建立（端口关闭 / IP 不通 / 超时 / 被防火墙拦） */
 			snprintf(g_last_error, sizeof(g_last_error),
-			         "已连上 %s:%d，但远程桌面握手失败。"
-			         "常见原因：1) 该端口不是远程桌面端口；"
-			         "2) 服务器要求网络级身份验证(NLA)，请在界面切换安全级别重试；"
-			         "3) 用户名或密码不正确（可试试「主机名\\用户名」格式）。"
-			         "（FreeRDP 未返回具体错误码 0x%08X）",
-			         hostStr, (int)s->ServerPort, (unsigned)errCode);
+			         "无法连接 %s:%d —— TCP 层就失败了（%s）。"
+			         "常见原因：1) 端口号填错，或该端口没有服务在监听；"
+			         "2) 目标 IP 不可达；3) 端口被防火墙/云安全组拦截。",
+			         hostStr, (int)s->ServerPort,
+			         (errStr && errStr[0]) ? errStr : "transport failed");
 		}
-		else if (strstr(errStr, "AUTHENTICATION") != NULL ||
-		         strstr(errStr, "LOGON") != NULL ||
-		         strstr(errStr, "PASSWORD") != NULL ||
-		         strstr(errStr, "CREDENTIAL") != NULL)
+		else if (isNegoFailed)
+		{
+			/* TCP 通了，但安全层协商失败。
+			 * 注意：这**不代表**对方是 RDP 服务器 —— 任何只接受 TCP 却不懂
+			 * RDP 协议的程序（如普通 HTTP 服务、自写监听脚本）都会走到这里。 */
+			snprintf(g_last_error, sizeof(g_last_error),
+			         "已连上 %s:%d，但 RDP 安全协商失败。"
+			         "可能原因：1) 该端口不是远程桌面端口（对方不是 RDP 服务）；"
+			         "2) 服务器与客户端安全级别不匹配，请尝试切换「安全级别」(NLA/TLS/RDP)；"
+			         "3) 服务器返回的数据不符合 RDP 协议。", hostStr, (int)s->ServerPort);
+		}
+		else if (strstr(errStr ? errStr : "", "AUTHENTICATION") != NULL ||
+		         strstr(errStr ? errStr : "", "LOGON") != NULL ||
+		         strstr(errStr ? errStr : "", "PASSWORD") != NULL ||
+		         strstr(errStr ? errStr : "", "CREDENTIAL") != NULL)
 		{
 			snprintf(g_last_error, sizeof(g_last_error),
 			         "认证失败：用户名或密码不正确。"
 			         "请确认账号密码无误；若域名/工作组有要求，用户名可写成「域\\用户名」或「主机名\\用户名」"
 			         "（底层：%s）", errStr);
 		}
-		else if (strstr(errStr, "TLS") != NULL ||
-		         strstr(errStr, "CERTIFICATE") != NULL ||
-		         strstr(errStr, "SECURITY") != NULL)
+		else if (strstr(errStr ? errStr : "", "TLS") != NULL ||
+		         strstr(errStr ? errStr : "", "CERTIFICATE") != NULL ||
+		         strstr(errStr ? errStr : "", "SECURITY") != NULL)
 		{
 			snprintf(g_last_error, sizeof(g_last_error),
 			         "安全层握手失败：%s。"
 			         "请尝试在界面切换「安全级别」（NLA / TLS / RDP）后重试。", errStr);
+		}
+		else if (errStr == NULL || errStr[0] == '\0' ||
+		         strncmp(errStr, "UNKNOWN", 7) == 0)
+		{
+			/* 无有效错误串：FreeRDP 内部重试会把错误码清 0，此时只能给综合提示 */
+			snprintf(g_last_error, sizeof(g_last_error),
+			         "连接 %s:%d 失败（FreeRDP 未返回具体错误码 0x%08X）。"
+			         "若该端口并非真正的远程桌面服务，或安全级别不匹配，均会失败 —— "
+			         "请确认目标确实开启了 RDP，并尝试切换「安全级别」重试。",
+			         hostStr, (int)s->ServerPort, (unsigned)errCode);
 		}
 		else
 		{

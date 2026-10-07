@@ -61,14 +61,16 @@ class NativeTransport : RdpTransport {
         // 3) 真正发起连接 —— 这一步会经 JNI 调用 FreeRDP 的 freerdp_connect()。
         //    防弹衣核心：包住所有可能的原生异常。
         return try {
-            Log.i(TAG, "调用 nativeConnect：${config.host.trim()}:$port " +
-                    "user=${config.username} domain=${config.domain} " +
-                    "security=${config.securityLevel} audio=${config.enableAudio}")
+            val t0 = System.currentTimeMillis()
+            Log.i(TAG, "【连接开始】目标=${config.host.trim()}:$port " +
+                    "用户=${config.username} 域=${config.domain} " +
+                    "安全级别=${config.securityLevel} 音频=${config.enableAudio}")
             val ok = FreerdpJni.nativeConnect(
                 config.host.trim(), port, config.username,
                 config.password, config.domain, config.enableAudio, config.securityLevel
             )
-            Log.i(TAG, "nativeConnect 返回：$ok")
+            val elapsed = System.currentTimeMillis() - t0
+            Log.i(TAG, "【连接结束】nativeConnect 返回=$ok 耗时=${elapsed}ms")
             connected = ok
             if (ok) {
                 // 音频开关设置失败不影响连接本身
@@ -80,17 +82,19 @@ class NativeTransport : RdpTransport {
                 ConnectionResult.Success
             } else {
                 // 【关键】把底层真实原因带回去，而不是只说一句"连接失败"。
-                // nativeGetLastError 现在保证在失败时一定有内容：
-                //   - native 侧先做 TCP 预检（端口拒绝/超时/DNS 失败都能精确区分）
-                //   - 预检通过但 RDP 握手失败时，也会给出带指向性的中文提示
-                // 所以这里不再需要"底层未返回具体原因"这种无信息量的兜底。
+                // nativeGetLastError 由 C 层在 freerdp_connect 失败后写入，
+                // 依据 FreeRDP 的真实错误码分类给出中文提示：
+                //   - ERR_CONNECT_TRANSPORT_FAILED     -> TCP 层就没连上
+                //   - ERR_SECURITY_NEGO_CONNECT_FAILED -> 安全协商失败（可能不是 RDP 服务）
+                //   - 认证失败 / TLS 失败 / 其它
                 val detail = try {
                     FreerdpJni.nativeGetLastError().takeIf { it.isNotBlank() }
                 } catch (t: Throwable) {
                     Log.e(TAG, "读取底层错误详情失败", t)
                     null
                 }
-                Log.e(TAG, "nativeConnect 返回 false，底层原因：${detail ?: "（原生层未提供）"}")
+                Log.e(TAG, "【连接失败】目标=${config.host}:$port 耗时=${elapsed}ms " +
+                        "底层原因=${detail ?: "（原生层未提供）"}")
                 ConnectionResult.Failure(
                     detail ?: ("已尝试连接 ${config.host}:$port 但失败。"
                             + "请检查网络、端口是否正确，以及远程桌面服务是否已开启。")
