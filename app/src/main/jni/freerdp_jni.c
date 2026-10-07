@@ -193,16 +193,26 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 		freerdp_free(old);
 	}
 
-	/* ---- 1) 参数校验：主机为空直接失败，不让底层拿到 NULL 崩溃 ---- */
+	/* ---- 1) 参数校验：主机为空直接失败，不让底层拿到 NULL 崩溃 ----
+	 *
+	 * 【v1.1.2 修复】以前这些提前返回分支只打 log、不写 g_last_error，
+	 * 导致 Kotlin 侧 nativeGetLastError() 拿到空串，UI 只能显示
+	 * 「连接失败，请检查网络、端口是否正确…」这种无信息量的兜底文案，
+	 * 把「参数非法」误报成「网络问题」。现在每条提前返回路径都必须
+	 * 写 g_last_error，保证失败原因一路带到 UI。 */
 	if (host == NULL)
 	{
 		__android_log_print(ANDROID_LOG_ERROR, TAG, "主机地址为空，放弃连接");
+		snprintf(g_last_error, sizeof(g_last_error),
+		         "主机地址为空（JNI 收到 NULL）。请在连接界面填写目标 IP 或主机名。");
 		return JNI_FALSE;
 	}
 	hostStr = (*env)->GetStringUTFChars(env, host, NULL);
 	if (hostStr == NULL || hostStr[0] == '\0')
 	{
 		__android_log_print(ANDROID_LOG_ERROR, TAG, "主机地址非法，放弃连接");
+		snprintf(g_last_error, sizeof(g_last_error),
+		         "主机地址为空字符串，无法连接。请填写目标 IP 或主机名。");
 		goto cleanup;
 	}
 	userStr = user   ? (*env)->GetStringUTFChars(env, user, NULL)   : NULL;
@@ -226,17 +236,27 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	 * 拿到真实错误码并给出分类提示（见下方 !ok 分支）。 */
 
 	/* ---- 2) 创建实例 ---- */
+	__android_log_print(ANDROID_LOG_INFO, TAG,
+	                    "步骤 2/6：freerdp_new() 创建实例…");
 	instance = freerdp_new();
 	if (instance == NULL)
 	{
 		__android_log_print(ANDROID_LOG_ERROR, TAG, "freerdp_new 失败");
+		snprintf(g_last_error, sizeof(g_last_error),
+		         "内部错误：FreeRDP 实例创建失败（freerdp_new 返回 NULL），"
+		         "连接未能发起。这通常意味着原生库未正确加载或内存不足。");
 		goto cleanup;
 	}
 
 	/* [崩溃点 2 修复] context 创建必须检查返回值 */
+	__android_log_print(ANDROID_LOG_INFO, TAG,
+	                    "步骤 3/6：freerdp_context_new() 创建上下文…");
 	if (!freerdp_context_new(instance) || instance->context == NULL)
 	{
 		__android_log_print(ANDROID_LOG_ERROR, TAG, "freerdp_context_new 失败");
+		snprintf(g_last_error, sizeof(g_last_error),
+		         "内部错误：FreeRDP 上下文创建失败（freerdp_context_new），"
+		         "连接未能发起。请卸载后重装本应用；若仍失败请反馈此错误码。");
 		freerdp_free(instance);
 		instance = NULL;
 		goto cleanup;
@@ -244,6 +264,8 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	if (instance->settings == NULL)
 	{
 		__android_log_print(ANDROID_LOG_ERROR, TAG, "settings 为空");
+		snprintf(g_last_error, sizeof(g_last_error),
+		         "内部错误：FreeRDP 配置对象为空（settings == NULL），连接未能发起。");
 		freerdp_free(instance);
 		instance = NULL;
 		goto cleanup;
@@ -375,6 +397,15 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	struct timespec tsStart, tsEnd;
 	clock_gettime(CLOCK_MONOTONIC, &tsStart);
 
+	/* 【需求 2】TCP connect 之前的最后一道标记。
+	 * 若 logcat 里看到了这一行、但服务器端没有任何连接记录，
+	 * 说明 socket 建立阶段（freerdp_tcp_connect -> DNS/getaddrinfo/connect）
+	 * 在设备侧就失败了 —— 而不是握手包发错。 */
+	__android_log_print(ANDROID_LOG_INFO, TAG,
+	                    "步骤 6/6：即将调用 freerdp_connect() —— "
+	                    "若此后 logcat 无更多输出且服务器无连接，问题在 TCP/DNS 层。 "
+	                    "目标 %s:%d", hostStr, (int)s->ServerPort);
+
 	BOOL ok = FALSE;
 	ok = freerdp_connect(instance);
 
@@ -436,13 +467,33 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 
 		if (isTransportFailed)
 		{
-			/* TCP 层失败：连接根本没建立（端口关闭 / IP 不通 / 超时 / 被防火墙拦） */
-			snprintf(g_last_error, sizeof(g_last_error),
-			         "无法连接 %s:%d —— TCP 层就失败了（%s）。"
-			         "常见原因：1) 端口号填错，或该端口没有服务在监听；"
-			         "2) 目标 IP 不可达；3) 端口被防火墙/云安全组拦截。",
-			         hostStr, (int)s->ServerPort,
-			         (errStr && errStr[0]) ? errStr : "transport failed");
+			/* TCP 层失败：连接根本没建立（端口关闭 / IP 不通 / 超时 / 被防火墙拦）。
+			 *
+			 * 【v1.1.2】结合耗时区分两种截然不同的情况，方便用户一步定位：
+			 *   - < 1s 秒失败：SYN 被立即拒绝（RST）-> 端口没开 / 被安全组拒绝
+			 *   - 约 10s 或更长：SYN 被静默丢弃 -> IP 不可达 / 被防火墙 DROP / 超时 */
+			if (elapsedMs < 1500)
+			{
+				snprintf(g_last_error, sizeof(g_last_error),
+				         "无法连接 %s:%d —— TCP 连接被立即拒绝（%ldms，%s）。"
+				         "含义：目标主机可达，但该端口没有服务在监听，或被防火墙/云安全组"
+				         "主动拒绝。请确认：1) 目标服务器上该端口的监听程序确实在运行；"
+				         "2) 云服务器安全组已放行该端口；3) 服务器本机防火墙已放行该端口。",
+				         hostStr, (int)s->ServerPort, elapsedMs,
+				         (errStr && errStr[0]) ? errStr : "transport failed");
+			}
+			else
+			{
+				snprintf(g_last_error, sizeof(g_last_error),
+				         "无法连接 %s:%d —— TCP 连接超时（%ldms，%s）。"
+				         "含义：发出 SYN 后没有收到任何回应，通常是 SYN 被防火墙静默丢弃。"
+				         "请确认：1) 目标 IP 是否可达（先用手机浏览器访问 "
+				         "http://%s:%d 试试）；2) 云安全组/防火墙是否放行该端口；"
+				         "3) 手机当前网络是否允许访问该公网地址。",
+				         hostStr, (int)s->ServerPort, elapsedMs,
+				         (errStr && errStr[0]) ? errStr : "transport failed",
+				         hostStr, (int)s->ServerPort);
+			}
 		}
 		else if (isNegoFailed)
 		{
@@ -516,6 +567,20 @@ cleanup:
 	{
 		freerdp_disconnect(instance);
 		freerdp_free(instance);
+	}
+
+	/* 【v1.1.2 修复】最终防线：走到这里若 g_last_error 仍为空，说明
+	 * 失败发生在某个未显式写错误的路径上。绝不能把空串交给 Kotlin，
+	 * 否则 UI 只能显示无信息量的兜底文案，把内部错误误报成网络问题。
+	 * 这里补一条带错误码的通用说明，保证 UI 永远拿到可播报的原因。 */
+	if (result == JNI_FALSE && g_last_error[0] == '\0')
+	{
+		snprintf(g_last_error, sizeof(g_last_error),
+		         "连接 %s 未能发起（原生层未返回具体错误）。"
+		         "可能是内部初始化失败，请卸载后重装本应用并重试。",
+		         hostStr ? hostStr : "(未知主机)");
+		__android_log_print(ANDROID_LOG_ERROR, TAG,
+		                    "⚠️ 失败路径未写入 g_last_error，已补兜底文案（这是代码缺陷，请反馈）");
 	}
 
 	return result;

@@ -37,6 +37,9 @@ class NativeTransport : RdpTransport {
         try {
             if (!FreerdpJni.isLibraryLoaded && !FreerdpJni.load()) {
                 val detail = FreerdpJni.lastLoadError
+                Log.e(TAG, "【原生库加载失败】isLibraryLoaded=false " +
+                        "lastLoadError=${detail ?: "（无）"} " +
+                        "提示：请确认 APK 内 lib/ 目录下有对应 ABI 的 libfreerdp_client.so")
                 return ConnectionResult.Failure(
                     "未找到 FreeRDP 原生库 (libfreerdp_client.so)"
                             + if (detail.isNullOrBlank()) "" else "：$detail"
@@ -46,6 +49,12 @@ class NativeTransport : RdpTransport {
             Log.e(TAG, "加载原生库失败", t)
             return ConnectionResult.Failure("原生库加载失败：${t.message}")
         }
+
+        // 【v1.1.2 需求 1】明确记录原生库状态：这是「TCP 没发出去」的第一嫌疑点。
+        // 若 isLibraryLoaded=false，nativeConnect 根本不会被调用，服务器自然什么都收不到。
+        Log.i(TAG, "【原生库状态】主库已加载=${FreerdpJni.isLibraryLoaded} " +
+                "音频后端=${FreerdpJni.isAudioBackendLoaded} " +
+                "加载告警=${FreerdpJni.lastLoadError ?: "无"}")
 
         // 2) 参数基本校验：主机为空不往下走，避免把非法值交给原生段
         if (config.host.isBlank()) {
@@ -58,6 +67,20 @@ class NativeTransport : RdpTransport {
         }
         val port = config.port
 
+        // 【v1.1.2 需求 6】在调用底层之前，先自己做一次纯诊断性的 DNS 解析，
+        // 并把结果打进 logcat。注意：这一步**只记录、不拦截**——
+        // 解析失败也照样往下走，由 FreeRDP 给出权威错误码，避免我们自己误判。
+        try {
+            val t0 = System.currentTimeMillis()
+            val addrs = java.net.InetAddress.getAllByName(config.host.trim())
+            val ms = System.currentTimeMillis() - t0
+            Log.i(TAG, "【DNS 解析】${config.host.trim()} -> " +
+                    addrs.joinToString { it.hostAddress ?: "?" } + " 耗时=${ms}ms")
+        } catch (t: Throwable) {
+            Log.w(TAG, "【DNS 解析】失败（仍继续交底层尝试）：" +
+                    "${t.javaClass.simpleName}: ${t.message}")
+        }
+
         // 3) 真正发起连接 —— 这一步会经 JNI 调用 FreeRDP 的 freerdp_connect()。
         //    防弹衣核心：包住所有可能的原生异常。
         return try {
@@ -65,6 +88,9 @@ class NativeTransport : RdpTransport {
             Log.i(TAG, "【连接开始】目标=${config.host.trim()}:$port " +
                     "用户=${config.username} 域=${config.domain} " +
                     "安全级别=${config.securityLevel} 音频=${config.enableAudio}")
+            Log.i(TAG, "【连接开始】即将进入 JNI nativeConnect（下一步会看到 " +
+                    "'>>> JNI nativeConnect 被调用' 的原生日志；" +
+                    "若看不到，说明卡在 JNI 之前的库加载阶段）")
             val ok = FreerdpJni.nativeConnect(
                 config.host.trim(), port, config.username,
                 config.password, config.domain, config.enableAudio, config.securityLevel
@@ -96,8 +122,10 @@ class NativeTransport : RdpTransport {
                 Log.e(TAG, "【连接失败】目标=${config.host}:$port 耗时=${elapsed}ms " +
                         "底层原因=${detail ?: "（原生层未提供）"}")
                 ConnectionResult.Failure(
-                    detail ?: ("已尝试连接 ${config.host}:$port 但失败。"
-                            + "请检查网络、端口是否正确，以及远程桌面服务是否已开启。")
+                    detail ?: ("已尝试连接 ${config.host}:$port 但失败，"
+                            + "且原生层未返回具体原因（耗时 ${elapsed}ms）。"
+                            + "这种情况通常是原生库内部初始化异常，"
+                            + "请卸载后重新安装本应用；若仍出现，请把此条完整信息反馈。")
                 )
             }
         } catch (e: UnsatisfiedLinkError) {
