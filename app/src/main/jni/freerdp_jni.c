@@ -34,6 +34,14 @@
 #include <freerdp/error.h>            /* freerdp_get_last_error / _string */
 #include <freerdp/channels/channels.h> /* freerdp_channels_load_plugin */
 #include <winpr/crt.h>
+#include <winpr/synch.h>              /* CreateEvent / CloseHandle / CRITICAL_SECTION */
+#include <winpr/collections.h>        /* PubSub_New / PubSub_Free */
+#include <freerdp/metrics.h>          /* metrics_new */
+
+/* 诊断金丝雀用到的内部函数（非公开 API，声明在此以免依赖内部头文件）：
+ *   freerdp_settings_free    —— 释放 freerdp_settings_new 创建的对象
+ *   freerdp_context_free     —— 释放 context（本文件不需要，保留说明） */
+extern void freerdp_settings_free(rdpSettings* settings);
 
 #define TAG "AccessRDP/JNI"
 
@@ -251,14 +259,97 @@ Java_com_accessrdp_client_jni_FreerdpJni_nativeConnect(
 	/* [崩溃点 2 修复] context 创建必须检查返回值 */
 	__android_log_print(ANDROID_LOG_INFO, TAG,
 	                    "步骤 3/6：freerdp_context_new() 创建上下文…");
-	if (!freerdp_context_new(instance) || instance->context == NULL)
+
+	/* 【v1.1.3 诊断金丝雀】freerdp_context_new() 内部有十几个子分配，
+	 * 任何一个失败都会整体返回 FALSE，但函数本身**不告诉我们是谁失败的**。
+	 * 真机上已确认它会失败（v1.1.2 日志：上下文创建失败），而 Linux 上却正常，
+	 * 说明是 Android 特有的资源/原语问题。
+	 *
+	 * 这里在调用真正的 freerdp_context_new() 之前，先把它的各个子步骤
+	 * **单独复现一遍**并逐个打印结果，从而精确定位是哪一个返回了 NULL：
+	 *   - calloc(ContextSize)          -> 内存分配
+	 *   - PubSub_New(TRUE)             -> 事件总线
+	 *   - metrics_new(ctx)             -> 指标
+	 *   - CreateEvent()                -> 事件对象（Android 上走 pthread）
+	 *   - freerdp_settings_new()       -> 约 46KB 的配置结构
+	 *   - InitializeCriticalSection*   -> 临界区（Android 上走 sem_init）
+	 *
+	 * 注意：这些是**独立的探针对象**，用完立即释放，不影响后续真正的创建。 */
 	{
-		__android_log_print(ANDROID_LOG_ERROR, TAG, "freerdp_context_new 失败");
-		snprintf(g_last_error, sizeof(g_last_error),
-		         "内部错误：FreeRDP 上下文创建失败（freerdp_context_new），"
-		         "连接未能发起。请卸载后重装本应用；若仍失败请反馈此错误码。");
+		rdpContext* probeCtx = (rdpContext*)calloc(1, instance->ContextSize);
+		__android_log_print(ANDROID_LOG_INFO, TAG,
+		                    "  [金丝雀1] calloc(ContextSize=%zu) = %s",
+		                    instance->ContextSize, probeCtx ? "OK" : "NULL(失败)");
+
+		if (probeCtx)
+		{
+			wPubSub* ps = PubSub_New(TRUE);
+			__android_log_print(ANDROID_LOG_INFO, TAG,
+			                    "  [金丝雀2] PubSub_New = %s", ps ? "OK" : "NULL(失败)");
+			if (ps) PubSub_Free(ps);
+
+			rdpMetrics* mt = metrics_new(probeCtx);
+			__android_log_print(ANDROID_LOG_INFO, TAG,
+			                    "  [金丝雀3] metrics_new = %s", mt ? "OK" : "NULL(失败)");
+			/* metrics_new 会挂到 context 上，随 probeCtx 一起在下文释放，故不单独 free */
+
+			probeCtx->metrics = mt;
+			free(probeCtx);
+		}
+
+		HANDLE ev = CreateEvent(NULL, TRUE, FALSE, NULL);
+		__android_log_print(ANDROID_LOG_INFO, TAG,
+		                    "  [金丝雀4] CreateEvent = %s", ev ? "OK" : "NULL(失败)");
+		if (ev) CloseHandle(ev);
+
+		rdpSettings* probeSettings = freerdp_settings_new(0);
+		__android_log_print(ANDROID_LOG_INFO, TAG,
+		                    "  [金丝雀5] freerdp_settings_new = %s (约 %zu 字节)",
+		                    probeSettings ? "OK" : "NULL(失败)", sizeof(rdpSettings));
+		if (probeSettings) freerdp_settings_free(probeSettings);
+
+		CRITICAL_SECTION cs;
+		BOOL csOk = InitializeCriticalSectionAndSpinCount(&cs, 4000);
+		__android_log_print(ANDROID_LOG_INFO, TAG,
+		                    "  [金丝雀6] InitializeCriticalSection = %s",
+		                    csOk ? "OK" : "NULL(失败)");
+		if (csOk) DeleteCriticalSection(&cs);
+	}
+
+	/* 第一次尝试 */
+	BOOL ctxOk = freerdp_context_new(instance);
+
+	if (!ctxOk || instance->context == NULL)
+	{
+		/* 【v1.1.3 自愈重试】真机实测 freerdp_context_new() 会失败，而 Linux 上正常。
+		 * 这类失败常常是一次性的（瞬时内存紧张、pthread/sem 原语初始化抖动）。
+		 * 这里丢掉旧实例、换一个全新实例再试一次 —— 成本很低，但可能直接救回来。 */
+		__android_log_print(ANDROID_LOG_WARN, TAG,
+		                    "freerdp_context_new 第 1 次失败，换新实例重试一次…");
 		freerdp_free(instance);
-		instance = NULL;
+		instance = freerdp_new();
+		if (instance != NULL)
+		{
+			ctxOk = freerdp_context_new(instance);
+			__android_log_print(ANDROID_LOG_INFO, TAG,
+			                    "重试结果：freerdp_context_new = %s, context = %p",
+			                    ctxOk ? "TRUE" : "FALSE", (void*)instance->context);
+		}
+	}
+
+	if (!ctxOk || instance == NULL || instance->context == NULL)
+	{
+		__android_log_print(ANDROID_LOG_ERROR, TAG,
+		                    "freerdp_context_new 失败（已重试一次仍失败）");
+		snprintf(g_last_error, sizeof(g_last_error),
+		         "内部错误：FreeRDP 上下文创建失败（freerdp_context_new 连续两次返回失败），"
+		         "连接未能发起。请把上面 logcat 里的 [金丝雀1]~[金丝雀6] 六行发给我们，"
+		         "它们会指出具体是哪个子组件分配失败。");
+		if (instance != NULL)
+		{
+			freerdp_free(instance);
+			instance = NULL;
+		}
 		goto cleanup;
 	}
 	if (instance->settings == NULL)
